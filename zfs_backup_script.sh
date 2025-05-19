@@ -2,7 +2,7 @@
 
 # ZFS Backup Script for Proxmox 8 / Debian 12
 # Automatic incremental backups to rotating external drives
-# Version: 1.0
+# Version: 1.1 - Improved to transfer all available snapshots
 # Author: Generated for Proxmox ZFS backup system
 
 # Exit on any error
@@ -153,6 +153,9 @@ load_config() {
     IFS=',' read -ra DATASETS_ARRAY <<< "$DATASETS"
     IFS=',' read -ra ALLOWED_DISK_IDS_ARRAY <<< "$ALLOWED_DISK_IDS"
     
+    # Set default snapshot prefix if not configured
+    SNAPSHOT_PREFIX="${SNAPSHOT_PREFIX:-autosnap}"
+    
     log "INFO" "Configuration loaded successfully"
 }
 
@@ -226,15 +229,15 @@ check_available_space() {
     log "INFO" "Space check passed"
 }
 
-# Get latest snapshot with prefix
-get_latest_snapshot() {
+# Get all snapshots with creation time for a dataset
+get_snapshots_with_time() {
     local dataset="$1"
     local prefix="$2"
     
+    # Return format: snapshot_name creation_timestamp
     zfs list -t snapshot -H -o name,creation -s creation "$dataset" 2>/dev/null | \
     grep "@$prefix" | \
-    tail -n 1 | \
-    awk '{print $1}'
+    awk '{print $1 " " $2}'
 }
 
 # Get snapshot GUID
@@ -249,36 +252,89 @@ get_snapshot_creation() {
     zfs get -H -o value creation "$snapshot" 2>/dev/null
 }
 
-# Find common snapshot between source and backup
-find_common_snapshot() {
+# Find common snapshots between source and backup
+find_common_snapshots() {
     local source_dataset="$1"
     local backup_dataset="$2"
     
-    log "INFO" "Finding common snapshot between $source_dataset and $backup_dataset"
+    log "DEBUG" "Finding common snapshots between $source_dataset and $backup_dataset"
     
-    # Get all snapshots from both datasets
-    local source_snapshots=($(zfs list -t snapshot -H -o name "$source_dataset" 2>/dev/null | sort))
-    local backup_snapshots=($(zfs list -t snapshot -H -o name "$backup_dataset" 2>/dev/null | sort))
+    # Get all snapshots from both datasets with GUIDs
+    local source_guids=()
+    local backup_guids=()
+    local common_snapshots=()
     
-    # Find latest common snapshot by GUID
-    local common_snapshot=""
-    for source_snap in "${source_snapshots[@]}"; do
-        local source_guid=$(get_snapshot_guid "$source_snap")
-        
-        for backup_snap in "${backup_snapshots[@]}"; do
-            local backup_guid=$(get_snapshot_guid "$backup_snap")
-            
-            if [[ "$source_guid" == "$backup_guid" ]]; then
-                common_snapshot="$source_snap"
-                break 2
-            fi
-        done
+    # Build associative arrays of GUIDs to snapshot names
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            local snap_name=$(echo "$line" | awk '{print $1}')
+            local guid=$(get_snapshot_guid "$snap_name")
+            source_guids["$guid"]="$snap_name"
+        fi
+    done < <(zfs list -t snapshot -H -o name "$source_dataset" 2>/dev/null | grep "@$SNAPSHOT_PREFIX")
+    
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            local snap_name=$(echo "$line" | awk '{print $1}')
+            local guid=$(get_snapshot_guid "$snap_name")
+            backup_guids["$guid"]="$snap_name"
+        fi
+    done < <(zfs list -t snapshot -H -o name "$backup_dataset" 2>/dev/null | grep "@$SNAPSHOT_PREFIX")
+    
+    # Find common GUIDs
+    for guid in "${!source_guids[@]}"; do
+        if [[ -n "${backup_guids[$guid]}" ]]; then
+            common_snapshots+=("${source_guids[$guid]}")
+        fi
     done
     
-    echo "$common_snapshot"
+    # Sort common snapshots by creation time
+    if [[ ${#common_snapshots[@]} -gt 0 ]]; then
+        printf '%s\n' "${common_snapshots[@]}" | while read -r snap; do
+            local creation=$(zfs get -H -o value creation "$snap" 2>/dev/null)
+            local timestamp=$(date -d "$creation" '+%s')
+            echo "$timestamp $snap"
+        done | sort -n | awk '{print $2}'
+    fi
 }
 
-# Perform incremental backup
+# Get snapshots that need to be transferred
+get_missing_snapshots() {
+    local source_dataset="$1"
+    local backup_dataset="$2"
+    
+    log "DEBUG" "Finding missing snapshots for $source_dataset"
+    
+    # Get all source snapshots with their GUIDs
+    local source_snapshots=()
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            source_snapshots+=("$line")
+        fi
+    done < <(zfs list -t snapshot -H -o name "$source_dataset" 2>/dev/null | grep "@$SNAPSHOT_PREFIX" | sort)
+    
+    # Get all backup snapshot GUIDs for comparison
+    local backup_guids=()
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            local guid=$(get_snapshot_guid "$line")
+            backup_guids["$guid"]=1
+        fi
+    done < <(zfs list -t snapshot -H -o name "$backup_dataset" 2>/dev/null | grep "@$SNAPSHOT_PREFIX")
+    
+    # Find snapshots that are missing from backup
+    local missing_snapshots=()
+    for source_snap in "${source_snapshots[@]}"; do
+        local source_guid=$(get_snapshot_guid "$source_snap")
+        if [[ -z "${backup_guids[$source_guid]}" ]]; then
+            missing_snapshots+=("$source_snap")
+        fi
+    done
+    
+    printf '%s\n' "${missing_snapshots[@]}"
+}
+
+# Perform backup with all snapshots
 perform_backup() {
     local dataset="$1"
     local source_dataset="$SOURCE_POOL/$dataset"
@@ -286,59 +342,104 @@ perform_backup() {
     
     log "INFO" "Starting backup for dataset: $dataset"
     
-    # Get latest source snapshot
-    local latest_source_snapshot=$(get_latest_snapshot "$source_dataset" "$SNAPSHOT_PREFIX")
+    # Get all source snapshots
+    local source_snapshots=($(zfs list -t snapshot -H -o name "$source_dataset" 2>/dev/null | grep "@$SNAPSHOT_PREFIX" | sort))
     
-    if [[ -z "$latest_source_snapshot" ]]; then
+    if [[ ${#source_snapshots[@]} -eq 0 ]]; then
         error_exit "No snapshots found for dataset $source_dataset with prefix $SNAPSHOT_PREFIX"
     fi
     
-    log "INFO" "Latest source snapshot: $latest_source_snapshot"
+    log "INFO" "Found ${#source_snapshots[@]} snapshots on source dataset"
     
     # Check if backup dataset exists
     if ! zfs list "$backup_dataset" >/dev/null 2>&1; then
-        log "INFO" "Backup dataset does not exist, creating initial backup"
+        log "INFO" "Backup dataset does not exist, creating initial backup with all snapshots"
         
         if [[ "$TEST_MODE" == true ]]; then
-            log "INFO" "TEST MODE: Would create initial backup from $latest_source_snapshot"
+            log "INFO" "TEST MODE: Would create initial backup with ${#source_snapshots[@]} snapshots"
+            for snap in "${source_snapshots[@]}"; do
+                log "INFO" "TEST MODE: Would transfer $snap"
+            done
             return 0
         fi
         
-        # Create initial backup
-        zfs send "$latest_source_snapshot" | zfs receive "$backup_dataset"
-        log "INFO" "Initial backup completed for $dataset"
+        # Send first snapshot as initial backup
+        local first_snapshot="${source_snapshots[0]}"
+        log "INFO" "Creating initial backup from $first_snapshot"
+        zfs send "$first_snapshot" | zfs receive "$backup_dataset"
+        
+        # Send remaining snapshots incrementally
+        for ((i=1; i<${#source_snapshots[@]}; i++)); do
+            local prev_snapshot="${source_snapshots[$((i-1))]}"
+            local curr_snapshot="${source_snapshots[$i]}"
+            
+            log "INFO" "Sending incremental: $prev_snapshot -> $curr_snapshot"
+            zfs send -i "$prev_snapshot" "$curr_snapshot" | zfs receive "$backup_dataset"
+        done
+        
+        log "INFO" "Initial backup completed for $dataset with all snapshots"
         return 0
     fi
     
-    # Find common snapshot
-    local common_snapshot=$(find_common_snapshot "$source_dataset" "$backup_dataset")
+    # Find common snapshots
+    local common_snapshots=($(find_common_snapshots "$source_dataset" "$backup_dataset"))
     
-    if [[ -z "$common_snapshot" ]]; then
-        error_exit "No common snapshot found between source and backup for dataset $dataset"
+    if [[ ${#common_snapshots[@]} -eq 0 ]]; then
+        log "WARN" "No common snapshots found. This might require a full resync."
+        
+        # Check if we should do a full resync
+        if [[ "${ALLOW_FULL_RESYNC:-false}" == "true" ]]; then
+            log "INFO" "Performing full resync as no common snapshots found"
+            
+            if [[ "$TEST_MODE" == true ]]; then
+                log "INFO" "TEST MODE: Would destroy backup dataset and perform full resync"
+                return 0
+            fi
+            
+            # Destroy existing backup and create fresh one
+            zfs destroy -r "$backup_dataset"
+            perform_backup "$dataset"
+            return $?
+        else
+            error_exit "No common snapshot found and ALLOW_FULL_RESYNC is not enabled"
+        fi
     fi
     
-    log "INFO" "Common snapshot found: $common_snapshot"
+    local latest_common="${common_snapshots[-1]}"
+    log "INFO" "Latest common snapshot: $latest_common"
     
-    # Check if backup is up to date
-    local latest_backup_snapshot=$(get_latest_snapshot "$backup_dataset" "$SNAPSHOT_PREFIX")
-    local source_guid=$(get_snapshot_guid "$latest_source_snapshot")
-    local backup_guid=$(get_snapshot_guid "$latest_backup_snapshot")
+    # Find missing snapshots
+    local missing_snapshots=($(get_missing_snapshots "$source_dataset" "$backup_dataset"))
     
-    if [[ "$source_guid" == "$backup_guid" ]]; then
+    if [[ ${#missing_snapshots[@]} -eq 0 ]]; then
         log "INFO" "Backup is already up to date for dataset $dataset"
         return 0
     fi
     
+    log "INFO" "Found ${#missing_snapshots[@]} snapshots to transfer"
+    
     if [[ "$TEST_MODE" == true ]]; then
-        log "INFO" "TEST MODE: Would perform incremental backup from $common_snapshot to $latest_source_snapshot"
+        log "INFO" "TEST MODE: Would transfer the following snapshots:"
+        for snap in "${missing_snapshots[@]}"; do
+            log "INFO" "TEST MODE: Would transfer $snap"
+        done
         return 0
     fi
     
-    # Perform incremental backup
-    log "INFO" "Performing incremental backup from $common_snapshot to $latest_source_snapshot"
-    zfs send -I "$common_snapshot" "$latest_source_snapshot" | zfs receive "$backup_dataset"
+    # Transfer missing snapshots
+    local from_snapshot="$latest_common"
     
-    log "INFO" "Incremental backup completed for $dataset"
+    for missing_snap in "${missing_snapshots[@]}"; do
+        log "INFO" "Transferring incremental: $from_snapshot -> $missing_snap"
+        
+        if ! zfs send -i "$from_snapshot" "$missing_snap" | zfs receive "$backup_dataset"; then
+            error_exit "Failed to transfer snapshot $missing_snap"
+        fi
+        
+        from_snapshot="$missing_snap"
+    done
+    
+    log "INFO" "Successfully transferred ${#missing_snapshots[@]} snapshots for dataset $dataset"
 }
 
 # Clean old snapshots
@@ -356,19 +457,39 @@ clean_old_snapshots() {
         dataset=$(echo "$dataset" | xargs)
         local backup_dataset="$BACKUP_POOL_NAME/$dataset"
         
-        # Get all snapshots for this dataset
-        local snapshots=($(zfs list -t snapshot -H -o name,creation "$backup_dataset" 2>/dev/null))
+        # Get all snapshots with creation times
+        local snapshots_info=($(get_snapshots_with_time "$backup_dataset" "$SNAPSHOT_PREFIX"))
         
-        for i in $(seq 0 2 $((${#snapshots[@]} - 1))); do
-            local snapshot="${snapshots[$i]}"
-            local creation="${snapshots[$i+1]}"
+        local snapshots_to_delete=()
+        
+        for snap_info in "${snapshots_info[@]}"; do
+            local snapshot=$(echo "$snap_info" | awk '{print $1}')
+            local creation=$(echo "$snap_info" | awk '{print $2}')
             local snapshot_date=$(date -d "$creation" '+%s')
             
             if [[ $snapshot_date -lt $cutoff_date ]]; then
-                log "INFO" "Deleting old snapshot: $snapshot (created: $creation)"
-                zfs destroy "$snapshot"
+                snapshots_to_delete+=("$snapshot")
             fi
         done
+        
+        # Delete old snapshots, but keep at least one snapshot for future incrementals
+        local total_snapshots=$(zfs list -t snapshot -H -o name "$backup_dataset" 2>/dev/null | grep "@$SNAPSHOT_PREFIX" | wc -l)
+        local keep_count=$((total_snapshots - ${#snapshots_to_delete[@]}))
+        
+        if [[ $keep_count -lt 1 ]]; then
+            # Keep the newest snapshot that would be deleted
+            local keep_newest="${snapshots_to_delete[-1]}"
+            snapshots_to_delete=(${snapshots_to_delete[@]/$keep_newest})
+            log "INFO" "Keeping at least one snapshot: $keep_newest"
+        fi
+        
+        for snapshot in "${snapshots_to_delete[@]}"; do
+            local creation=$(get_snapshot_creation "$snapshot")
+            log "INFO" "Deleting old snapshot: $snapshot (created: $creation)"
+            zfs destroy "$snapshot"
+        done
+        
+        log "INFO" "Cleaned ${#snapshots_to_delete[@]} old snapshots for dataset $dataset"
     done
 }
 
@@ -399,21 +520,27 @@ EOF
     for dataset in "${DATASETS_ARRAY[@]}"; do
         dataset=$(echo "$dataset" | xargs)
         local source_dataset="$SOURCE_POOL/$dataset"
-        local latest_snapshot=$(get_latest_snapshot "$source_dataset" "$SNAPSHOT_PREFIX")
         
-        if [[ -n "$latest_snapshot" ]]; then
-            local creation=$(get_snapshot_creation "$latest_snapshot")
-            echo "source_$dataset $latest_snapshot $creation" >> "$piggyback_file"
+        # Get newest and count of source snapshots
+        local source_snapshots=($(zfs list -t snapshot -H -o name "$source_dataset" 2>/dev/null | grep "@$SNAPSHOT_PREFIX"))
+        local source_count=${#source_snapshots[@]}
+        
+        if [[ $source_count -gt 0 ]]; then
+            local latest_source="${source_snapshots[-1]}"
+            local source_creation=$(get_snapshot_creation "$latest_source")
+            echo "source_$dataset $latest_source $source_creation count:$source_count" >> "$piggyback_file"
         fi
         
         # Add backup snapshot info if pool is still imported
         if zpool list "$BACKUP_POOL_NAME" >/dev/null 2>&1; then
             local backup_dataset="$BACKUP_POOL_NAME/$dataset"
-            local backup_snapshot=$(get_latest_snapshot "$backup_dataset" "$SNAPSHOT_PREFIX")
+            local backup_snapshots=($(zfs list -t snapshot -H -o name "$backup_dataset" 2>/dev/null | grep "@$SNAPSHOT_PREFIX"))
+            local backup_count=${#backup_snapshots[@]}
             
-            if [[ -n "$backup_snapshot" ]]; then
-                local backup_creation=$(get_snapshot_creation "$backup_snapshot")
-                echo "backup_$dataset $backup_snapshot $backup_creation" >> "$piggyback_file"
+            if [[ $backup_count -gt 0 ]]; then
+                local latest_backup="${backup_snapshots[-1]}"
+                local backup_creation=$(get_snapshot_creation "$latest_backup")
+                echo "backup_$dataset $latest_backup $backup_creation count:$backup_count" >> "$piggyback_file"
             fi
         fi
     done
@@ -444,7 +571,7 @@ update_system() {
 
 # Main backup function
 main() {
-    log "INFO" "ZFS Backup Script started"
+    log "INFO" "ZFS Backup Script started (Version 1.1 - All Snapshots)"
     
     # Parse arguments
     parse_arguments "$@"
