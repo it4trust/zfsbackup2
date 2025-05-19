@@ -259,25 +259,27 @@ find_common_snapshots() {
     
     log "DEBUG" "Finding common snapshots between $source_dataset and $backup_dataset"
     
-    # Get all snapshots from both datasets with GUIDs
-    local source_guids=()
-    local backup_guids=()
+    # Declare associative arrays
+    declare -A source_guids
+    declare -A backup_guids
     local common_snapshots=()
     
     # Build associative arrays of GUIDs to snapshot names
-    while IFS= read -r line; do
-        if [[ -n "$line" ]]; then
-            local snap_name=$(echo "$line" | awk '{print $1}')
+    while IFS= read -r snap_name; do
+        if [[ -n "$snap_name" ]]; then
             local guid=$(get_snapshot_guid "$snap_name")
-            source_guids["$guid"]="$snap_name"
+            if [[ -n "$guid" ]]; then
+                source_guids["$guid"]="$snap_name"
+            fi
         fi
     done < <(zfs list -t snapshot -H -o name "$source_dataset" 2>/dev/null | grep "@$SNAPSHOT_PREFIX")
     
-    while IFS= read -r line; do
-        if [[ -n "$line" ]]; then
-            local snap_name=$(echo "$line" | awk '{print $1}')
+    while IFS= read -r snap_name; do
+        if [[ -n "$snap_name" ]]; then
             local guid=$(get_snapshot_guid "$snap_name")
-            backup_guids["$guid"]="$snap_name"
+            if [[ -n "$guid" ]]; then
+                backup_guids["$guid"]="$snap_name"
+            fi
         fi
     done < <(zfs list -t snapshot -H -o name "$backup_dataset" 2>/dev/null | grep "@$SNAPSHOT_PREFIX")
     
@@ -305,7 +307,10 @@ get_missing_snapshots() {
     
     log "DEBUG" "Finding missing snapshots for $source_dataset"
     
-    # Get all source snapshots with their GUIDs
+    # Declare associative array
+    declare -A backup_guids
+    
+    # Get all source snapshots
     local source_snapshots=()
     while IFS= read -r line; do
         if [[ -n "$line" ]]; then
@@ -314,11 +319,12 @@ get_missing_snapshots() {
     done < <(zfs list -t snapshot -H -o name "$source_dataset" 2>/dev/null | grep "@$SNAPSHOT_PREFIX" | sort)
     
     # Get all backup snapshot GUIDs for comparison
-    local backup_guids=()
     while IFS= read -r line; do
         if [[ -n "$line" ]]; then
             local guid=$(get_snapshot_guid "$line")
-            backup_guids["$guid"]=1
+            if [[ -n "$guid" ]]; then
+                backup_guids["$guid"]=1
+            fi
         fi
     done < <(zfs list -t snapshot -H -o name "$backup_dataset" 2>/dev/null | grep "@$SNAPSHOT_PREFIX")
     
@@ -326,7 +332,7 @@ get_missing_snapshots() {
     local missing_snapshots=()
     for source_snap in "${source_snapshots[@]}"; do
         local source_guid=$(get_snapshot_guid "$source_snap")
-        if [[ -z "${backup_guids[$source_guid]}" ]]; then
+        if [[ -n "$source_guid" && -z "${backup_guids[$source_guid]}" ]]; then
             missing_snapshots+=("$source_snap")
         fi
     done
@@ -426,16 +432,38 @@ perform_backup() {
         return 0
     fi
     
-    # Transfer missing snapshots
-    local from_snapshot="$latest_common"
+    # Find the starting point for incremental transfer
+    # We need to find the latest snapshot that exists in both source and backup
+    local from_snapshot=""
     
-    for missing_snap in "${missing_snapshots[@]}"; do
+    # Sort missing snapshots by creation time to transfer in correct order
+    local sorted_missing=()
+    if [[ ${#missing_snapshots[@]} -gt 0 ]]; then
+        while IFS= read -r snap; do
+            sorted_missing+=("$snap")
+        done < <(
+            for snap in "${missing_snapshots[@]}"; do
+                local creation=$(zfs get -H -o value creation "$snap" 2>/dev/null)
+                local timestamp=$(date -d "$creation" '+%s')
+                echo "$timestamp $snap"
+            done | sort -n | awk '{print $2}'
+        )
+    fi
+    
+    # Transfer missing snapshots
+    for missing_snap in "${sorted_missing[@]}"; do
+        # For the first transfer, use the latest common snapshot as base
+        if [[ -z "$from_snapshot" ]]; then
+            from_snapshot="$latest_common"
+        fi
+        
         log "INFO" "Transferring incremental: $from_snapshot -> $missing_snap"
         
         if ! zfs send -i "$from_snapshot" "$missing_snap" | zfs receive "$backup_dataset"; then
             error_exit "Failed to transfer snapshot $missing_snap"
         fi
         
+        # Update from_snapshot for next transfer
         from_snapshot="$missing_snap"
     done
     
