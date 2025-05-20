@@ -1,393 +1,692 @@
 #!/bin/bash
+# =================================================================
+# ZFSBackup2 - Automatisierte inkrementelle ZFS-Backups
+# für Proxmox 8 auf Debian 12
+# =================================================================
 
-# ZFS Backup Script für Proxmox 8 / Debian 12
-# Automatische inkrementelle Backups auf rotierende externe Festplatten
-# Version: 1.2 – Überarbeitete Snapshot-Verwaltung und Auto-Snapshot-Deaktivierung
-# Author: Generated for Proxmox ZFS backup system
+# Strict mode
+set -euo pipefail
 
-set -e  # Skript bricht bei jedem Fehler ab
+# Script directory and name
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_NAME=$(basename "$0")
+VERSION="1.0.0"
 
-# Globale Variablen
-SCRIPT_NAME="$(basename "$0")"
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-CONFIG_FILE="/etc/zfs-backup-script.conf"
-LOCK_FILE="/var/run/zfs_backup.lock"
-LOG_FILE="/var/log/zfs-backup.log"
-CHECKMK_DIR="/var/spool/check_mk_agent/piggyback"
-VERBOSE=false
-TEST_MODE=false
+# Constants and defaults
+readonly DEFAULT_CONFIG_DIR="/etc/zfsbackup2"
+readonly DEFAULT_CONFIG_FILE="${DEFAULT_CONFIG_DIR}/zfsbackup2.conf"
+readonly DEFAULT_LOG_DIR="/var/log/zfsbackup2"
+readonly DEFAULT_LOG_FILE="${DEFAULT_LOG_DIR}/zfsbackup2.log"
+readonly DEFAULT_LOCK_FILE="/var/run/zfsbackup2.lock"
+readonly DEFAULT_CHECKMK_DIR="/var/lib/check_mk_agent/spool"
+readonly DEFAULT_CHECKMK_FILE="${DEFAULT_CHECKMK_DIR}/zfsbackup2_status"
+readonly DEFAULT_DATASETS=""
+readonly DEFAULT_TARGET_POOL="backuppool"
+readonly DEFAULT_MAX_USAGE=80
+readonly DEFAULT_MAX_RETRIES=1
+readonly DEFAULT_ALLOWED_DISK_IDS=""
+readonly DEFAULT_SNAPSHOT_TYPES="weekly,monthly"
 
-# Farb-Codes für Output
-RED='\033[0;31m';   GREEN='\033[0;32m'
-YELLOW='\033[1;33m'; BLUE='\033[0;34m'
-NC='\033[0m'  # No Color
+# Actual variables (will be overridden by config)
+CONFIG_FILE="${DEFAULT_CONFIG_FILE}"
+LOG_DIR="${DEFAULT_LOG_DIR}"
+LOG_FILE="${DEFAULT_LOG_FILE}"
+LOCK_FILE="${DEFAULT_LOCK_FILE}"
+CHECKMK_DIR="${DEFAULT_CHECKMK_DIR}"
+CHECKMK_FILE="${DEFAULT_CHECKMK_DIR}/zfsbackup2_status"
+DATASETS="${DEFAULT_DATASETS}"
+TARGET_POOL="${DEFAULT_TARGET_POOL}"
+MAX_USAGE=${DEFAULT_MAX_USAGE}
+MAX_RETRIES=${DEFAULT_MAX_RETRIES}
+ALLOWED_DISK_IDS="${DEFAULT_ALLOWED_DISK_IDS}"
+SNAPSHOT_TYPES="${DEFAULT_SNAPSHOT_TYPES}"
+RETRY_COUNT=0
 
-# Logging-Funktion
-log() {
-    local level="$1"; shift
-    local message="$*"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo -e "${timestamp} [${level}] ${message}" | tee -a "${LOG_FILE}"
-    if [[ "$VERBOSE" == true ]]; then
-        case "$level" in
-            INFO)  echo -e "${GREEN}[INFO]${NC}  $message" ;;
-            WARN)  echo -e "${YELLOW}[WARN]${NC}  $message" ;;
-            ERROR) echo -e "${RED}[ERROR]${NC} $message" ;;
-            DEBUG) echo -e "${BLUE}[DEBUG]${NC} $message" ;;
-        esac
-    fi
-}
+# ==================== FUNCTIONS ====================
 
-# Fehlerbehandlung
-error_exit() {
-    log "ERROR" "$1"
-    cleanup
-    exit 1
-}
-
-# Aufräumfunktion
-cleanup() {
-    [[ -f "$LOCK_FILE" ]] && { rm -f "$LOCK_FILE"; log "INFO" "Lock-File entfernt"; }
-    if [[ -n "$BACKUP_POOL_NAME" ]] && zpool list "$BACKUP_POOL_NAME" &>/dev/null; then
-        log "INFO" "Exportiere Backup-Pool: $BACKUP_POOL_NAME"
-        zpool export "$BACKUP_POOL_NAME" || log "WARN" "Export von $BACKUP_POOL_NAME fehlgeschlagen"
-    fi
-}
-
-trap cleanup EXIT
-trap 'error_exit "Skript durch Benutzer unterbrochen"' INT TERM
-
-# Argumente parsen
-parse_arguments() {
-    while getopts "vth" opt; do
-        case $opt in
-            v) VERBOSE=true ;;
-            t) TEST_MODE=true ;;
-            h) show_help; exit 0 ;;
-            *) error_exit "Ungültige Option. Mit -h Hilfe anzeigen." ;;
-        esac
-    done
-}
-
-# Hilfe anzeigen
-show_help() {
+# Print usage information
+usage() {
     cat << EOF
-Usage: $SCRIPT_NAME [OPTIONS]
+Usage: ${SCRIPT_NAME} [options]
 
-ZFS Backup Script – inkrementelle Backups auf externe Laufwerke
+Automated incremental ZFS backups for Proxmox 8 on Debian 12.
 
-OPTIONS:
-  -v    Verbose mode (detailliertes Logging)
-  -t    Test mode (Konfig prüfen, ohne zu übertragen)
-  -h    Diese Hilfe
-
-CONFIGURATION:
-  $CONFIG_FILE
+Options:
+  -c, --config FILE    Use specific config file (default: ${DEFAULT_CONFIG_FILE})
+  -h, --help           Display this help and exit
+  -v, --version        Output version information and exit
+  -t, --test           Test configuration and exit
 
 EOF
 }
 
-# Prüfen, ob root
-check_root() {
-    [[ $EUID -ne 0 ]] && error_exit "Dieses Skript muss als root ausgeführt werden."
+# Logger function
+log() {
+    local level="$1"
+    local message="$2"
+    local timestamp
+    timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    
+    # Ensure log directory exists
+    mkdir -p "${LOG_DIR}"
+    
+    # Print to stdout (if not in cron)
+    if [ -t 1 ] || [ "${level}" == "ERROR" ]; then
+        echo "[${timestamp}] [${level}] ${message}"
+    fi
+    
+    # Log to file
+    echo "[${timestamp}] [${level}] ${message}" >> "${LOG_FILE}"
 }
 
-# Lockfile anlegen
+# Create lock file
 create_lock() {
-    if [[ -f "$LOCK_FILE" ]]; then
-        local pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "unknown")
-        error_exit "Schon eine Instanz aktiv (PID: $pid). Lock: $LOCK_FILE"
+    if [ -f "${LOCK_FILE}" ]; then
+        local pid
+        pid=$(cat "${LOCK_FILE}")
+        if ps -p "${pid}" > /dev/null; then
+            log "ERROR" "Another instance of this script is already running (PID: ${pid})"
+            exit 1
+        else
+            log "WARNING" "Found stale lock file. Previous run may have failed. Removing and continuing."
+            rm -f "${LOCK_FILE}"
+        fi
     fi
-    echo $$ > "$LOCK_FILE"
-    log "INFO" "Lock-File erstellt: $LOCK_FILE"
+    
+    echo $$ > "${LOCK_FILE}"
+    log "INFO" "Lock file created: ${LOCK_FILE} (PID: $$)"
 }
 
-# Konfiguration laden
+# Remove lock file
+remove_lock() {
+    if [ -f "${LOCK_FILE}" ]; then
+        rm -f "${LOCK_FILE}"
+        log "INFO" "Lock file removed: ${LOCK_FILE}"
+    fi
+}
+
+# Create directories if they don't exist
+create_directories() {
+    mkdir -p "${LOG_DIR}"
+    mkdir -p "${CHECKMK_DIR}"
+    # Ensure proper permissions
+    chmod 755 "${LOG_DIR}"
+    chmod 755 "${CHECKMK_DIR}"
+}
+
+# Load configuration file
 load_config() {
-    [[ ! -f "$CONFIG_FILE" ]] && error_exit "Config nicht gefunden: $CONFIG_FILE"
-    source "$CONFIG_FILE"
-    local required=(SOURCE_POOL BACKUP_POOL_NAME ALLOWED_DISK_IDS DATASETS MIN_FREE_SPACE_GB SNAPSHOT_RETENTION_DAYS CHECKMK_HOST)
-    for var in "${required[@]}"; do
-        [[ -z "${!var}" ]] && error_exit "Config-Variable '$var' fehlt in $CONFIG_FILE"
-    done
-    IFS=',' read -ra DATASETS_ARRAY <<< "$DATASETS"
-    IFS=',' read -ra ALLOWED_DISK_IDS_ARRAY <<< "$ALLOWED_DISK_IDS"
-    SNAPSHOT_PREFIX="${SNAPSHOT_PREFIX:-autosnap}"
-    log "INFO" "Konfiguration geladen"
+    if [ ! -f "${CONFIG_FILE}" ]; then
+        log "ERROR" "Config file not found: ${CONFIG_FILE}"
+        exit 1
+    fi
+
+    log "INFO" "Loading configuration from ${CONFIG_FILE}"
+    
+    # Source the config file
+    # shellcheck disable=SC1090
+    source "${CONFIG_FILE}"
+    
+    # Validate required settings
+    if [ -z "${DATASETS}" ]; then
+        log "ERROR" "No datasets defined in config file"
+        exit 1
+    fi
+    
+    if [ -z "${TARGET_POOL}" ]; then
+        log "ERROR" "No target pool defined in config file"
+        exit 1
+    }
+    
+    if [ -z "${ALLOWED_DISK_IDS}" ]; then
+        log "ERROR" "No allowed disk IDs defined in config file"
+        exit 1
+    fi
+    
+    log "INFO" "Configuration loaded successfully"
 }
 
-# ZFS-Prüfungen
-check_zfs_prerequisites() {
-    lsmod | grep -q zfs || error_exit "ZFS-Modul nicht geladen"
-    zpool list "$SOURCE_POOL" &>/dev/null || error_exit "Source-Pool '$SOURCE_POOL' nicht gefunden"
-    for ds in "${DATASETS_ARRAY[@]}"; do
-        ds=$(echo "$ds"|xargs)
-        zfs list "$SOURCE_POOL/$ds" &>/dev/null || error_exit "Dataset '$SOURCE_POOL/$ds' nicht gefunden"
-    done
-    log "INFO" "ZFS-Prüfungen erfolgreich"
+# Check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
 }
 
-# Backup-Disk finden und importieren
-import_backup_disk() {
-    log "INFO" "Suche Backup-Disk..."
-    local found=""
-    for id in "${ALLOWED_DISK_IDS_ARRAY[@]}"; do
-        id=$(echo "$id"|xargs)
-        for path in /dev/disk/by-id/*; do
-            [[ "$path" == *"$id"* ]] && { found="$path"; break 2; }
-        done
-    done
-    [[ -z "$found" ]] && error_exit "Keine erlaubte Backup-Disk gefunden (erwartet: ${ALLOWED_DISK_IDS_ARRAY[*]})"
-    log "INFO" "Gefunden: $found"
-    log "INFO" "Importiere Pool '$BACKUP_POOL_NAME'"
-    zpool import -d "$(dirname "$found")" "$BACKUP_POOL_NAME" 2>/dev/null \
-        || error_exit "Import von '$BACKUP_POOL_NAME' fehlgeschlagen"
-    log "INFO" "Backup-Pool importiert"
-}
-
-# Auto-Snapshots deaktivieren für ein Dataset
-disable_auto_snapshots_for_dataset() {
-    local ds="$1"
-    local props=(
-        "com.sun:auto-snapshot"
-        "com.sun:auto-snapshot:frequent"
-        "com.sun:auto-snapshot:hourly"
-        "com.sun:auto-snapshot:daily"
-        "com.sun:auto-snapshot:weekly"
-        "com.sun:auto-snapshot:monthly"
-    )
-    for p in "${props[@]}"; do
-        [[ "$TEST_MODE" == false ]] && zfs set "$p"=false "$ds" &>/dev/null || true
-    done
-    log "INFO" "Auto-Snapshots deaktiviert für $ds"
-}
-
-# Auto-Snapshots für alle Backup-Datasets deaktivieren
-disable_auto_snapshots() {
-    log "INFO" "Deaktiviere Auto-Snapshots auf Backup-Pool und -Datasets"
-    disable_auto_snapshots_for_dataset "$BACKUP_POOL_NAME"
-    for ds in "${DATASETS_ARRAY[@]}"; do
-        ds=$(echo "$ds"|xargs)
-        disable_auto_snapshots_for_dataset "$BACKUP_POOL_NAME/$ds"
-    done
-}
-
-# Snapshot-GUID holen
-get_snapshot_guid() {
-    zfs get -H -o value guid "$1" 2>/dev/null
-}
-
-# Per Dataset: gemeinsame Snapshots finden
-find_common_snapshots() {
-    local src="$1" dst="$2"
-    log "DEBUG" "Finde gemeinsame Snapshots $src ↔ $dst"
-    declare -A srcg dstg; local commons=()
-    while read -r s; do [[ -n "$s" ]] && srcg["$(get_snapshot_guid "$s")"]=$s; done < <(zfs list -t snapshot -H -o name "$src" | grep "@$SNAPSHOT_PREFIX")
-    while read -r s; do [[ -n "$s" ]] && dstg["$(get_snapshot_guid "$s")"]=$s; done < <(zfs list -t snapshot -H -o name "$dst" | grep "@$SNAPSHOT_PREFIX")
-    for guid in "${!srcg[@]}"; do
-        [[ -n "${dstg[$guid]}" ]] && commons+=("${srcg[$guid]}")
-    done
-    # nach Creation-Time sortieren
-    printf '%s\n' "${commons[@]}" | while read -r snap; do
-        ts=$(date -d "$(zfs get -H -o value creation "$snap")" '+%s')
-        echo "$ts $snap"
-    done | sort -n | awk '{print $2}'
-}
-
-# Backup durchführen
-perform_backup() {
-    local ds="$1"
-    local src_ds="$SOURCE_POOL/$ds"
-    local dst_ds="$BACKUP_POOL_NAME/$ds"
-    log "INFO" "Backup für Dataset: $ds"
-    # alle Snapshots sortiert nach Zeit
-    mapfile -t snaps < <(zfs list -t snapshot -H -o name,creation "$src_ds" \
-        | grep "@$SNAPSHOT_PREFIX" | sort -k2 | awk '{print $1}')
-    [[ ${#snaps[@]} -eq 0 ]] && error_exit "Keine Snapshots in $src_ds mit Prefix $SNAPSHOT_PREFIX"
-    log "INFO" "Quelle hat ${#snaps[@]} Snapshots"
-    if ! zfs list "$dst_ds" &>/dev/null; then
-        log "INFO" "Ziel existiert nicht – initiales Backup aller Snapshots"
-        if [[ "$TEST_MODE" == true ]]; then
-            for s in "${snaps[@]}"; do log "INFO" "TEST: würde übertragen $s"; done
-            return 0
+# Check prerequisites
+check_prerequisites() {
+    log "INFO" "Checking prerequisites..."
+    
+    local missing_prerequisites=0
+    
+    # Check for required commands
+    for cmd in zfs zpool awk sed grep sort head tail tr cut wc; do
+        if ! command_exists "${cmd}"; then
+            log "ERROR" "Required command not found: ${cmd}"
+            missing_prerequisites=1
         fi
-        # erstes Snapshot
-        zfs send "${snaps[0]}" | zfs receive "$dst_ds"
-        disable_auto_snapshots_for_dataset "$dst_ds"
-        # restliche inkrementell
-        for ((i=1;i<${#snaps[@]};i++)); do
-            zfs send -i "${snaps[i-1]}" "${snaps[i]}" | zfs receive "$dst_ds"
+    done
+    
+    # Check for zfs-auto-snapshot
+    if ! command_exists zfs-auto-snapshot; then
+        log "ERROR" "zfs-auto-snapshot not found. Please install it first."
+        missing_prerequisites=1
+    fi
+    
+    # Check if running as root
+    if [ "$(id -u)" -ne 0 ]; then
+        log "ERROR" "This script must be run as root"
+        missing_prerequisites=1
+    fi
+    
+    if [ "${missing_prerequisites}" -eq 1 ]; then
+        exit 1
+    fi
+    
+    log "INFO" "All prerequisites satisfied"
+}
+
+# Get a list of external drives
+get_external_drives() {
+    local drives=()
+    local disks
+    
+    # Get a list of all block devices
+    disks=$(lsblk -dno NAME,TYPE | grep disk | awk '{print $1}')
+    
+    for disk in $disks; do
+        local wwn
+        local serial
+        local model
+        local size
+        
+        # Get disk identifiers
+        wwn=$(udevadm info --query=property --name="/dev/${disk}" | grep -E '^ID_WWN=' | cut -d= -f2)
+        serial=$(udevadm info --query=property --name="/dev/${disk}" | grep -E '^ID_SERIAL(_SHORT)?=' | head -1 | cut -d= -f2)
+        model=$(udevadm info --query=property --name="/dev/${disk}" | grep -E '^ID_MODEL=' | cut -d= -f2)
+        size=$(lsblk -dno SIZE "/dev/${disk}" | tr -d ' ')
+        
+        # Check if the disk ID is in the allowed list
+        IFS=',' read -r -a allowed_ids <<< "${ALLOWED_DISK_IDS}"
+        for id in "${allowed_ids[@]}"; do
+            if [ -n "${wwn}" ] && [ "${wwn}" == "${id}" ]; then
+                drives+=("/dev/${disk}")
+                log "INFO" "Found allowed external drive: /dev/${disk} (WWN: ${wwn}, Model: ${model}, Size: ${size})"
+                break
+            elif [ -n "${serial}" ] && [ "${serial}" == "${id}" ]; then
+                drives+=("/dev/${disk}")
+                log "INFO" "Found allowed external drive: /dev/${disk} (Serial: ${serial}, Model: ${model}, Size: ${size})"
+                break
+            fi
         done
-        log "INFO" "Initiales Backup abgeschlossen"
+    done
+    
+    if [ ${#drives[@]} -eq 0 ]; then
+        log "ERROR" "No allowed external drives found. Allowed IDs: ${ALLOWED_DISK_IDS}"
+        return 1
+    fi
+    
+    echo "${drives[*]}"
+    return 0
+}
+
+# Import ZFS pool
+import_pool() {
+    local drive="$1"
+    
+    log "INFO" "Checking if target pool ${TARGET_POOL} is already imported..."
+    if zpool list -H "${TARGET_POOL}" &>/dev/null; then
+        log "INFO" "Pool ${TARGET_POOL} is already imported"
         return 0
     fi
-    # gemeinsame Snapshots ermitteln
-    mapfile -t common < <(find_common_snapshots "$src_ds" "$dst_ds")
-    if [[ ${#common[@]} -eq 0 ]]; then
-        log "WARN" "Keine gemeinsamen Snapshots – Full-Resync nötig?"
-        [[ "${ALLOW_FULL_RESYNC:-false}" == "true" ]] || error_exit "ALLOW_FULL_RESYNC nicht aktiviert"
-        if [[ "$TEST_MODE" == true ]]; then
-            log "INFO" "TEST: würde Full-Resync durchführen"
-            return 0
-        fi
-        zfs destroy -r "$dst_ds"
-        perform_backup "$ds"
-        return $?
+    
+    log "INFO" "Attempting to import pool ${TARGET_POOL} from ${drive}..."
+    if ! zpool import -d "${drive}" "${TARGET_POOL}"; then
+        log "ERROR" "Failed to import pool ${TARGET_POOL} from ${drive}"
+        return 1
     fi
-    # neuesten gemeinsamen finden
-    local latest=$(printf '%s\n' "${common[@]}" | while read -r s; do
-        ts=$(date -d "$(zfs get -H -o value creation "$s")" '+%s')
-        echo "$ts $s"
-    done|sort -n|tail -1|awk '{print $2}')
-    log "INFO" "Neuester gemeinsamer Snapshot: $latest"
-    # fehlende (jüngere) finden
-    local latest_time=$(date -d "$(zfs get -H -o value creation "$latest")" '+%s')
-    missing=()
-    for s in "${snaps[@]}"; do
-        ts=$(date -d "$(zfs get -H -o value creation "$s")" '+%s')
-        if (( ts > latest_time )); then
-            # GUID-Abgleich
-            guid_src=$(get_snapshot_guid "$s")
-            found=false
-            while read -r dsnap; do
-                [[ "$(get_snapshot_guid "$dsnap")" == "$guid_src" ]] && { found=true; break; }
-            done < <(zfs list -t snapshot -H -o name "$dst_ds" | grep "@$SNAPSHOT_PREFIX")
-            $found || missing+=("$s")
-        fi
-    done
-    [[ ${#missing[@]} -eq 0 ]] && { log "INFO" "Alles aktuell"; return 0; }
-    # sortieren
-    mapfile -t missing < <(for s in "${missing[@]}"; do
-        ts=$(date -d "$(zfs get -H -o value creation "$s")" '+%s')
-        echo "$ts $s"
-    done|sort -n|awk '{print $2}')
-    log "INFO" "Übertrage ${#missing[@]} fehlende Snapshots"
-    if [[ "$TEST_MODE" == true ]]; then
-        for s in "${missing[@]}"; do
-            log "INFO" "TEST: würde übertragen $s"
-        done
+    
+    log "INFO" "Successfully imported pool ${TARGET_POOL}"
+    return 0
+}
+
+# Export ZFS pool
+export_pool() {
+    log "INFO" "Exporting pool ${TARGET_POOL}..."
+    if ! zpool export "${TARGET_POOL}"; then
+        log "WARNING" "Failed to export pool ${TARGET_POOL}"
+        return 1
+    fi
+    
+    log "INFO" "Successfully exported pool ${TARGET_POOL}"
+    return 0
+}
+
+# Check pool usage
+check_pool_usage() {
+    local pool="$1"
+    local used_percent
+    
+    used_percent=$(zpool list -H -o capacity "${pool}" | tr -d '%')
+    
+    log "INFO" "Checking pool usage: ${pool} is ${used_percent}% full (max allowed: ${MAX_USAGE}%)"
+    
+    if [ "${used_percent}" -ge "${MAX_USAGE}" ]; then
+        log "ERROR" "Pool ${pool} is too full (${used_percent}% used, max allowed: ${MAX_USAGE}%)"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Find the newest common snapshot between source and target
+find_newest_common_snapshot() {
+    local source_dataset="$1"
+    local target_dataset="$2"
+    
+    log "INFO" "Finding newest common snapshot between ${source_dataset} and ${target_dataset}..."
+    
+    # Get list of snapshots from source and target, filtering by specified types
+    local source_snapshots
+    local target_snapshots
+    local snapshot_types_regex
+    
+    # Convert comma-separated list to regex OR pattern
+    snapshot_types_regex=$(echo "${SNAPSHOT_TYPES}" | sed 's/,/\\|/g')
+    
+    # Get source snapshots
+    source_snapshots=$(zfs list -H -t snapshot -o name,guid,creation -S creation "${source_dataset}" | 
+                       grep -E "zfs-auto-snap_(${snapshot_types_regex}).*" | 
+                       awk '{print $1"|"$2"|"$3}')
+    
+    if [ -z "${source_snapshots}" ]; then
+        log "ERROR" "No suitable snapshots found on source dataset ${source_dataset}"
+        return 1
+    fi
+    
+    # Check if target dataset exists
+    if ! zfs list -H "${target_dataset}" &>/dev/null; then
+        log "INFO" "Target dataset ${target_dataset} does not exist, will create it with initial backup"
+        echo ""
         return 0
     fi
-    local from="$latest"
-    for s in "${missing[@]}"; do
-        zfs send -i "$from" "$s" | zfs receive "$dst_ds" \
-            || error_exit "Übertragung von $s fehlgeschlagen"
-        from="$s"
-    done
-    log "INFO" "Übertragung abgeschlossen (${#missing[@]} Snapshots)"
-}
-
-# Alte Snapshots löschen
-clean_old_snapshots() {
-    log "INFO" "Lösche Snapshots älter als $SNAPSHOT_RETENTION_DAYS Tage"
-    [[ "$TEST_MODE" == true ]] && { log "INFO" "TEST: würde alte Snapshots löschen"; return 0; }
-    cutoff=$(date -d "$SNAPSHOT_RETENTION_DAYS days ago" '+%s')
-    for ds in "${DATASETS_ARRAY[@]}"; do
-        ds=$(echo "$ds"|xargs)
-        dst_ds="$BACKUP_POOL_NAME/$ds"
-        mapfile -t info < <(get_snapshots_with_time "$dst_ds" "$SNAPSHOT_PREFIX")
-        delete=()
-        for entry in "${info[@]}"; do
-            snap=$(echo "$entry"|awk '{print $1}')
-            ts=$(date -d "$(echo "$entry"|awk '{print $2}')" '+%s')
-            (( ts < cutoff )) && delete+=("$snap")
-        done
-        total=$(zfs list -t snapshot -H -o name "$dst_ds" | grep "@$SNAPSHOT_PREFIX" | wc -l)
-        keep=$(( total - ${#delete[@]} ))
-        if (( keep < 1 )); then
-            last=${delete[-1]}
-            delete=( "${delete[@]/$last}" )
-            log "INFO" "Bewahre mindestens einen Snapshot: $last"
+    
+    # Get target snapshots
+    target_snapshots=$(zfs list -H -t snapshot -o name,guid,creation -S creation "${target_dataset}" | 
+                       grep -E "zfs-auto-snap_(${snapshot_types_regex}).*" | 
+                       awk '{print $1"|"$2"|"$3}')
+    
+    if [ -z "${target_snapshots}" ]; then
+        log "WARNING" "No suitable snapshots found on target dataset ${target_dataset}, will use full backup"
+        echo ""
+        return 0
+    fi
+    
+    # Find common snapshots by GUID
+    local common_snapshot=""
+    while IFS= read -r source_snap; do
+        local source_guid
+        source_guid=$(echo "${source_snap}" | cut -d'|' -f2)
+        
+        if echo "${target_snapshots}" | grep -q "${source_guid}"; then
+            common_snapshot=$(echo "${source_snap}" | cut -d'|' -f1)
+            local creation_date
+            creation_date=$(echo "${source_snap}" | cut -d'|' -f3)
+            log "INFO" "Found common snapshot: ${common_snapshot} (created: ${creation_date})"
+            echo "${common_snapshot}"
+            return 0
         fi
-        for s in "${delete[@]}"; do
-            log "INFO" "Lösche $s"
-            zfs destroy "$s"
-        done
-        log "INFO" "Gelöschte Snapshots: ${#delete[@]} für $ds"
-    done
+    done <<< "${source_snapshots}"
+    
+    log "WARNING" "No common snapshots found between ${source_dataset} and ${target_dataset}, will use full backup"
+    echo ""
+    return 0
 }
 
-# Hilfsfunktion für clean_old_snapshots
-get_snapshots_with_time() {
-    local ds="$1" pref="$2"
-    zfs list -t snapshot -H -o name,creation -s creation "$ds" 2>/dev/null \
-      | grep "@$pref" \
-      | awk '{print $1" "$2}'
+# Perform incremental backup for a single dataset
+backup_dataset() {
+    local source_dataset="$1"
+    local target_dataset="${TARGET_POOL}/${source_dataset#*/}"
+    local common_snapshot
+    
+    log "INFO" "Starting backup of dataset: ${source_dataset} to ${target_dataset}"
+    
+    # Find the newest common snapshot
+    common_snapshot=$(find_newest_common_snapshot "${source_dataset}" "${target_dataset}")
+    local backup_type="full"
+    local source_latest
+    
+    # Get the latest snapshot of the specified types from source
+    source_latest=$(zfs list -H -t snapshot -o name -S creation "${source_dataset}" | 
+                   grep -E "zfs-auto-snap_($(echo "${SNAPSHOT_TYPES}" | sed 's/,/\\|/g')).*" | 
+                   head -1)
+    
+    if [ -z "${source_latest}" ]; then
+        log "ERROR" "No suitable snapshots found on source dataset ${source_dataset}"
+        return 1
+    fi
+    
+    # Prepare the zfs send command
+    local send_cmd
+    if [ -z "${common_snapshot}" ]; then
+        # Full backup
+        send_cmd="zfs send -v '${source_latest}'"
+        log "INFO" "Performing full backup using snapshot: ${source_latest}"
+    else
+        # Incremental backup
+        send_cmd="zfs send -v -I '${common_snapshot}' '${source_latest}'"
+        backup_type="incremental"
+        log "INFO" "Performing incremental backup from ${common_snapshot} to ${source_latest}"
+    fi
+    
+    # Prepare the zfs receive command
+    local receive_cmd="zfs receive -F -v '${target_dataset}'"
+    
+    # Execute the backup
+    log "INFO" "Executing: ${send_cmd} | ${receive_cmd}"
+    
+    # Create a fifo to capture output while still piping between commands
+    local fifo_file
+    fifo_file=$(mktemp -u)
+    mkfifo "${fifo_file}"
+    
+    # Start the receive process in the background
+    eval "${receive_cmd} < '${fifo_file}'" > >(tee -a "${LOG_FILE}") 2>&1 &
+    local receive_pid=$!
+    
+    # Start the send process
+    eval "${send_cmd} > '${fifo_file}'" > >(tee -a "${LOG_FILE}") 2>&1
+    local send_status=$?
+    
+    # Wait for receive to complete
+    wait "${receive_pid}"
+    local receive_status=$?
+    
+    # Remove the fifo
+    rm -f "${fifo_file}"
+    
+    # Check the results
+    if [ "${send_status}" -eq 0 ] && [ "${receive_status}" -eq 0 ]; then
+        log "INFO" "Successfully completed ${backup_type} backup of ${source_dataset} to ${target_dataset}"
+        return 0
+    else
+        log "ERROR" "Backup failed for ${source_dataset}. Send status: ${send_status}, Receive status: ${receive_status}"
+        return 1
+    fi
 }
 
-# CheckMK-Piggyback erzeugen
-create_checkmk_piggyback() {
-    local status="$1" msg="$2"
-    [[ -z "$CHECKMK_HOST" ]] && { log "WARN" "CHECKMK_HOST nicht gesetzt"; return; }
-    mkdir -p "$CHECKMK_DIR"
-    local file="$CHECKMK_DIR/$CHECKMK_HOST"
-    echo "<<<local:sep(0)>>>" > "$file"
-    echo "$status ZFS_Backup - $(date '+%Y-%m-%d %H:%M:%S') - $msg" >> "$file"
-    echo "<<<zfs_snapshots:sep(0)>>>" >> "$file"
-    for ds in "${DATASETS_ARRAY[@]}"; do
-        ds=$(echo "$ds"|xargs)
-        src_ds="$SOURCE_POOL/$ds"
-        snaps=( $(zfs list -t snapshot -H -o name "$src_ds" | grep "@$SNAPSHOT_PREFIX") )
-        (( ${#snaps[@]}>0 )) && echo "source_$ds ${snaps[-1]} $(get_snapshot_creation "${snaps[-1]}") count:${#snaps[@]}" >> "$file"
-        if zpool list "$BACKUP_POOL_NAME" &>/dev/null; then
-            dst_ds="$BACKUP_POOL_NAME/$ds"
-            dsn=( $(zfs list -t snapshot -H -o name "$dst_ds" | grep "@$SNAPSHOT_PREFIX") )
-            (( ${#dsn[@]}>0 )) && echo "backup_$ds ${dsn[-1]} $(get_snapshot_creation "${dsn[-1]}") count:${#dsn[@]}" >> "$file"
+# Update CheckMK status file
+update_checkmk_status() {
+    local status="$1"
+    local message="$2"
+    local backup_date
+    backup_date=$(date "+%Y-%m-%d %H:%M:%S")
+    
+    log "INFO" "Updating CheckMK status file: ${CHECKMK_FILE}"
+    
+    mkdir -p "${CHECKMK_DIR}"
+    
+    cat > "${CHECKMK_FILE}" << EOF
+<<<zfsbackup2>>>
+P "ZFS Backup Status" ${status} - ${message} (Last run: ${backup_date})
+EOF
+    
+    # Set appropriate permissions
+    chmod 644 "${CHECKMK_FILE}"
+    
+    log "INFO" "CheckMK status updated: ${status} - ${message}"
+}
+
+# Generate snapshot comparison for CheckMK
+generate_snapshot_comparison() {
+    local status=0
+    local comparison_output=""
+    local age_warning=0
+    local now
+    now=$(date +%s)
+    
+    log "INFO" "Generating snapshot comparison for CheckMK..."
+    
+    # Process each dataset
+    IFS=',' read -r -a dataset_array <<< "${DATASETS}"
+    for source_dataset in "${dataset_array[@]}"; do
+        local target_dataset="${TARGET_POOL}/${source_dataset#*/}"
+        
+        # Skip if the target dataset doesn't exist yet
+        if ! zfs list -H "${target_dataset}" &>/dev/null; then
+            comparison_output="${comparison_output}P \"${target_dataset}\" 1 - Dataset does not exist yet\n"
+            status=1
+            continue
+        fi
+        
+        # Get the latest snapshot from source and target
+        local source_latest
+        local target_latest
+        local source_latest_time
+        local target_latest_time
+        local time_diff
+        
+        source_latest=$(zfs list -H -t snapshot -o name,creation -S creation "${source_dataset}" | 
+                       grep -E "zfs-auto-snap_($(echo "${SNAPSHOT_TYPES}" | sed 's/,/\\|/g')).*" | 
+                       head -1)
+        
+        target_latest=$(zfs list -H -t snapshot -o name,creation -S creation "${target_dataset}" |
+                       grep -E "zfs-auto-snap_($(echo "${SNAPSHOT_TYPES}" | sed 's/,/\\|/g')).*" | 
+                       head -1)
+        
+        if [ -z "${source_latest}" ] || [ -z "${target_latest}" ]; then
+            comparison_output="${comparison_output}P \"${target_dataset}\" 1 - Missing snapshots\n"
+            status=1
+            continue
+        fi
+        
+        # Extract creation timestamps
+        source_latest_time=$(echo "${source_latest}" | awk '{print $2}')
+        target_latest_time=$(echo "${target_latest}" | awk '{print $2}')
+        
+        # Convert timestamps to Unix time for comparison
+        source_latest_unix=$(date -d "${source_latest_time}" +%s)
+        target_latest_unix=$(date -d "${target_latest_time}" +%s)
+        time_diff=$((now - target_latest_unix))
+        
+        # Output snapshot names
+        source_latest_name=$(echo "${source_latest}" | awk '{print $1}')
+        target_latest_name=$(echo "${target_latest}" | awk '{print $1}')
+        
+        # Check if backup is older than 24 hours (86400 seconds)
+        if [ "${time_diff}" -gt 86400 ]; then
+            comparison_output="${comparison_output}P \"${target_dataset}\" 1 - Last backup too old (${target_latest_time}), source latest: ${source_latest_name}\n"
+            age_warning=1
+        else
+            comparison_output="${comparison_output}P \"${target_dataset}\" 0 - Last backup: ${target_latest_time}, source latest: ${source_latest_time}\n"
         fi
     done
-    log "INFO" "CheckMK-Piggyback: $file"
+    
+    # Update final status
+    status=$((status | age_warning))
+    
+    # Write to CheckMK file
+    mkdir -p "${CHECKMK_DIR}"
+    cat > "${CHECKMK_FILE}" << EOF
+<<<zfsbackup2>>>
+P "ZFS Backup Status" ${status} - Last run: $(date "+%Y-%m-%d %H:%M:%S")
+$(echo -e "${comparison_output}")
+EOF
+    
+    # Set appropriate permissions
+    chmod 644 "${CHECKMK_FILE}"
+    
+    log "INFO" "CheckMK status file updated with snapshot comparison"
+    
+    return ${status}
 }
 
-get_snapshot_creation() {
-    zfs get -H -o value creation "$1" 2>/dev/null
-}
-
-# System-Update
-update_system() {
-    [[ "$ENABLE_SYSTEM_UPDATE" != "true" ]] && { log "INFO" "System-Update deaktiviert"; return; }
-    if [[ "$TEST_MODE" == true ]]; then
-        log "INFO" "TEST: würde System-Update durchführen"
-        return
+# Run system updates
+run_system_updates() {
+    log "INFO" "Running system updates..."
+    
+    if ! apt-get update; then
+        log "WARNING" "Failed to update package lists"
+        return 1
     fi
-    log "INFO" "Starte System-Update..."
-    if apt update && apt dist-upgrade -y; then
-        log "INFO" "Update erfolgreich"
+    
+    if ! apt-get dist-upgrade -y; then
+        log "WARNING" "Failed to upgrade packages"
+        return 1
+    }
+    
+    log "INFO" "System update completed successfully"
+    
+    # Check if reboot is required
+    if [ -f /var/run/reboot-required ]; then
+        log "INFO" "System reboot is required after updates"
+        # Update CheckMK status to indicate reboot required
+        echo "P \"System Update Status\" 1 - Reboot required after updates" >> "${CHECKMK_FILE}"
     else
-        log "WARN" "Update fehlgeschlagen"
+        log "INFO" "No reboot required after updates"
+        echo "P \"System Update Status\" 0 - System updated, no reboot required" >> "${CHECKMK_FILE}"
     fi
+    
+    return 0
 }
 
-# Main
-main() {
-    log "INFO" "Starte ZFS Backup Script (v1.2)"
-    parse_arguments "$@"
-    check_root
-    create_lock
-    load_config
-    check_zfs_prerequisites
-    import_backup_disk
-    disable_auto_snapshots
-    check_available_space
-    [[ "$TEST_MODE" == true ]] && { create_checkmk_piggyback 0 "Testmodus – alle Prüfungen erfolgreich"; return 0; }
-
-    local success=true
-    for ds in "${DATASETS_ARRAY[@]}"; do
-        ds=$(echo "$ds"|xargs)
-        perform_backup "$ds" || { success=false; log "ERROR" "Backup fehlgeschlagen für $ds"; }
+# Main backup procedure
+do_backup() {
+    local all_success=0
+    
+    log "INFO" "Starting ZFS backup procedure..."
+    
+    # Get external drives
+    local external_drives
+    external_drives=$(get_external_drives) || {
+        log "ERROR" "No suitable external drives found"
+        update_checkmk_status 2 "No suitable external drives found"
+        return 1
+    }
+    
+    # Import the pool
+    import_pool "${external_drives}" || {
+        log "ERROR" "Failed to import the target pool"
+        update_checkmk_status 2 "Failed to import the target pool"
+        return 1
+    }
+    
+    # Check pool usage
+    check_pool_usage "${TARGET_POOL}" || {
+        log "ERROR" "Target pool usage exceeds threshold"
+        update_checkmk_status 2 "Target pool usage exceeds threshold (${MAX_USAGE}%)"
+        export_pool
+        return 1
+    }
+    
+    # Process each dataset
+    IFS=',' read -r -a dataset_array <<< "${DATASETS}"
+    log "INFO" "Processing ${#dataset_array[@]} datasets: ${DATASETS}"
+    
+    for dataset in "${dataset_array[@]}"; do
+        log "INFO" "Processing dataset: ${dataset}"
+        if ! backup_dataset "${dataset}"; then
+            log "ERROR" "Backup failed for dataset: ${dataset}"
+            all_success=1
+        fi
     done
-
-    if $success; then
-        clean_old_snapshots
-        create_checkmk_piggyback 0 "Backup erfolgreich"
-        log "INFO" "Exportiere Backup-Pool"
-        zpool export "$BACKUP_POOL_NAME"
-        BACKUP_POOL_NAME=""
-        update_system
-        log "INFO" "Script erfolgreich beendet"
+    
+    # Generate snapshot comparison for CheckMK
+    generate_snapshot_comparison
+    
+    # Run system updates if all backups were successful
+    if [ "${all_success}" -eq 0 ]; then
+        log "INFO" "All backups completed successfully, running system updates"
+        run_system_updates
     else
-        create_checkmk_piggyback 2 "Backup für einige Datasets fehlgeschlagen"
-        error_exit "Backup gescheitert"
+        log "WARNING" "Some backups failed, skipping system updates"
+        update_checkmk_status 1 "Some backups failed"
     fi
+    
+    # Export the pool
+    export_pool
+    
+    return "${all_success}"
 }
 
-main "$@"
+# Clean up function (trap for exit)
+cleanup() {
+    local exit_code=$?
+    log "INFO" "Script execution completed with exit code ${exit_code}"
+    remove_lock
+    exit "${exit_code}"
+}
+
+# ==================== MAIN SCRIPT ====================
+
+# Parse command line arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c|--config)
+            CONFIG_FILE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -v|--version)
+            echo "ZFSBackup2 version ${VERSION}"
+            exit 0
+            ;;
+        -t|--test)
+            TEST_MODE=1
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# Set up trap for cleanup
+trap cleanup EXIT INT TERM
+
+# Create directories
+create_directories
+
+# Start logging
+log "INFO" "===== ZFSBackup2 v${VERSION} started ====="
+
+# Load configuration
+load_config
+
+# Check prerequisites
+check_prerequisites
+
+# If test mode, exit now
+if [ "${TEST_MODE:-0}" -eq 1 ]; then
+    log "INFO" "Configuration test completed successfully"
+    exit 0
+fi
+
+# Create lock file
+create_lock
+
+# Main backup procedure with retry logic
+if ! do_backup; then
+    if [ "${RETRY_COUNT}" -lt "${MAX_RETRIES}" ]; then
+        log "WARNING" "Backup failed, retrying (attempt ${RETRY_COUNT}/${MAX_RETRIES})..."
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+        # Wait a bit before retrying
+        sleep 5
+        if ! do_backup; then
+            log "ERROR" "Backup failed after retry"
+            update_checkmk_status 2 "Backup failed after retry"
+            exit 1
+        fi
+    else
+        log "ERROR" "Backup failed, max retries reached"
+        update_checkmk_status 2 "Backup failed, max retries reached"
+        exit 1
+    fi
+fi
+
+log "INFO" "===== ZFSBackup2 completed successfully ====="
+update_checkmk_status 0 "Backup completed successfully"
+exit 0
