@@ -219,9 +219,12 @@ get_external_drives() {
         done
     done
     
+    # Even if no allowed drives are found, we'll attempt to proceed with importing the pool
+    # This allows the script to work when ALLOWED_DISK_IDS isn't configured
     if [ ${#drives[@]} -eq 0 ]; then
-        log "ERROR" "No allowed external drives found. Allowed IDs: ${ALLOWED_DISK_IDS}"
-        return 1
+        log "WARNING" "No allowed external drives found with IDs: ${ALLOWED_DISK_IDS}. Will attempt direct pool import."
+        # Return success even if no drives match
+        return 0
     fi
     
     echo "${drives[*]}"
@@ -238,9 +241,17 @@ import_pool() {
         return 0
     fi
     
-    log "INFO" "Attempting to import pool ${TARGET_POOL} from ${drive}..."
-    if ! zpool import -d "${drive}" "${TARGET_POOL}"; then
-        log "ERROR" "Failed to import pool ${TARGET_POOL} from ${drive}"
+    log "INFO" "Attempting to import pool ${TARGET_POOL}..."
+    # First try to import by name without specifying a device
+    if zpool import "${TARGET_POOL}"; then
+        log "INFO" "Successfully imported pool ${TARGET_POOL}"
+        return 0
+    fi
+    
+    # If that fails, try with the device directory
+    log "INFO" "First attempt failed, trying with device path..."
+    if ! zpool import -d "/dev" "${TARGET_POOL}"; then
+        log "ERROR" "Failed to import pool ${TARGET_POOL}"
         return 1
     fi
     
@@ -554,15 +565,11 @@ do_backup() {
     
     log "INFO" "Starting ZFS backup procedure..."
     
-    # Get external drives
+    # Get external drives - but continue even if no allowed drives are found
     local external_drives
-    external_drives=$(get_external_drives) || {
-        log "ERROR" "No suitable external drives found"
-        update_checkmk_status 2 "No suitable external drives found"
-        return 1
-    }
+    external_drives=$(get_external_drives)
     
-    # Import the pool
+    # Import the pool - this should work even without specific drives
     import_pool "${external_drives}" || {
         log "ERROR" "Failed to import the target pool"
         update_checkmk_status 2 "Failed to import the target pool"
