@@ -136,7 +136,7 @@ load_config() {
     if [ -z "${TARGET_POOL}" ]; then
         log "ERROR" "No target pool defined in config file"
         exit 1
-    }
+    fi
     
     if [ -z "${ALLOWED_DISK_IDS}" ]; then
         log "ERROR" "No allowed disk IDs defined in config file"
@@ -531,7 +531,7 @@ run_system_updates() {
     if ! apt-get dist-upgrade -y; then
         log "WARNING" "Failed to upgrade packages"
         return 1
-    }
+    fi
     
     log "INFO" "System update completed successfully"
     
