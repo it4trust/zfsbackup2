@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# ZFS Backup Script v1.0
+# ZFS Backup Script v1.1
 # Automatisierte inkrementelle ZFS-Backups auf wechselnde externe Festplatten
 # Kompatibel mit Proxmox 8 / Debian 12
 
@@ -137,6 +137,12 @@ identify_and_import_backup_disk() {
         error_exit "Keine gültige Backup-Festplatte gefunden. Erwartete IDs: $BACKUP_DISK_IDS"
     fi
     
+    # Prüfen ob Pool bereits importiert ist
+    if zpool list "$BACKUP_POOL" >/dev/null 2>&1; then
+        log "INFO" "Backup-Pool ist bereits importiert: $BACKUP_POOL"
+        return
+    fi
+    
     # Pool importieren
     log "INFO" "Importiere Backup-Pool: $BACKUP_POOL"
     if [[ "$DRY_RUN" == false ]]; then
@@ -171,7 +177,7 @@ find_common_snapshot() {
     local source_dataset="$1"
     local target_dataset="$2"
     
-    vlog "Suche gemeinsamen Snapshot zwischen $source_dataset und $target_dataset"
+    vlog "Suche gemeinsamen Snapshot zwischen $source_dataset und $target_dataset" >&2
     
     # Alle zfs-auto-snap_daily Snapshots der Quelle holen
     local source_snapshots
@@ -182,7 +188,7 @@ find_common_snapshot() {
     fi
     
     if [[ -z "$source_snapshots" ]]; then
-        vlog "Keine zfs-auto-snap_daily Snapshots in $source_dataset gefunden"
+        vlog "Keine zfs-auto-snap_daily Snapshots in $source_dataset gefunden" >&2
         echo ""
         return
     fi
