@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# ZFS Backup Script v1.1
+# ZFS Backup Script v1.2
 # Automatisierte inkrementelle ZFS-Backups auf wechselnde externe Festplatten
 # Kompatibel mit Proxmox 8 / Debian 12
+# Neu: Flexibles Dataset-Mapping
 
 set -euo pipefail
 
@@ -78,7 +79,7 @@ load_config() {
     
     # Standardwerte setzen
     MIN_FREE_SPACE_GB=${MIN_FREE_SPACE_GB:-10}
-    FULL_BACKUP_ON_NO_COMMON=${FULL_BACKUP_ON_NO_COMMON:-false}
+    FULL_BACKUP_ON_NO_COMMON=${FULL_BACKUP_ON_NO_COMMON:-true}
     SYSTEM_UPDATE_ENABLED=${SYSTEM_UPDATE_ENABLED:-false}
     CHECKMK_ENABLED=${CHECKMK_ENABLED:-true}
     CHECKMK_PIGGYBACK_DIR=${CHECKMK_PIGGYBACK_DIR:-"/var/spool/check_mk_agent/piggyback"}
@@ -87,6 +88,7 @@ load_config() {
     vlog "- DATASETS: $DATASETS"
     vlog "- BACKUP_POOL: $BACKUP_POOL"
     vlog "- MIN_FREE_SPACE_GB: $MIN_FREE_SPACE_GB"
+    vlog "- FULL_BACKUP_ON_NO_COMMON: $FULL_BACKUP_ON_NO_COMMON"
 }
 
 # Lockfile prüfen und erstellen
@@ -172,12 +174,45 @@ check_free_space() {
     log "INFO" "Verfügbarer Speicherplatz: ${available_gb}GB (Minimum: ${MIN_FREE_SPACE_GB}GB)"
 }
 
+# Dataset-Mapping parsen
+parse_dataset_mapping() {
+    local dataset_config="$1"
+    local source_dataset=""
+    local target_dataset=""
+    
+    if [[ "$dataset_config" == *":"* ]]; then
+        # Format: "source:target"
+        source_dataset="${dataset_config%%:*}"
+        target_dataset="${dataset_config##*:}"
+        
+        # Wenn target_dataset nicht mit dem BACKUP_POOL beginnt, ist es relativ
+        if [[ "$target_dataset" != "$BACKUP_POOL"* ]]; then
+            target_dataset="${BACKUP_POOL}/${target_dataset}"
+        fi
+    else
+        # Traditionelles Format: "rpool/data" -> "backuppool/rpool/data"
+        source_dataset="$dataset_config"
+        target_dataset="${BACKUP_POOL}/${source_dataset}"
+    fi
+    
+    echo "$source_dataset|$target_dataset"
+}
+
 # Gemeinsamen Snapshot finden
 find_common_snapshot() {
     local source_dataset="$1"
     local target_dataset="$2"
     
     vlog "Suche gemeinsamen Snapshot zwischen $source_dataset und $target_dataset" >&2
+    
+    # Prüfe zuerst ob das Ziel-Dataset überhaupt existiert
+    if [[ "$DRY_RUN" == false ]]; then
+        if ! zfs list "$target_dataset" >/dev/null 2>&1; then
+            vlog "Ziel-Dataset $target_dataset existiert nicht - kein gemeinsamer Snapshot möglich" >&2
+            echo ""
+            return
+        fi
+    fi
     
     # Alle zfs-auto-snap_daily Snapshots der Quelle holen
     local source_snapshots
@@ -193,24 +228,36 @@ find_common_snapshot() {
         return
     fi
     
-    # Prüfe jeden Snapshot auf Existenz im Ziel
-    while IFS= read -r snapshot; do
-        [[ -z "$snapshot" ]] && continue
+    # Alle Snapshots des Ziels holen
+    local target_snapshots
+    if [[ "$DRY_RUN" == false ]]; then
+        target_snapshots=$(zfs list -H -t snapshot -o name "$target_dataset" 2>/dev/null | grep "zfs-auto-snap_daily" || true)
+    else
+        target_snapshots="$target_dataset@zfs-auto-snap_daily-2024-01-20-00h00"
+    fi
+    
+    if [[ -z "$target_snapshots" ]]; then
+        vlog "Keine zfs-auto-snap_daily Snapshots in $target_dataset gefunden" >&2
+        echo ""
+        return
+    fi
+    
+    # Prüfe jeden Quell-Snapshot auf Existenz im Ziel
+    while IFS= read -r source_snapshot; do
+        [[ -z "$source_snapshot" ]] && continue
         
-        local snap_name="${snapshot##*@}"
+        local snap_name="${source_snapshot##*@}"
         local target_snapshot="${target_dataset}@${snap_name}"
         
-        if [[ "$DRY_RUN" == false ]]; then
-            if zfs list -H -t snapshot "$target_snapshot" >/dev/null 2>&1; then
-                echo "$snapshot"
-                return
-            fi
-        else
-            echo "$snapshot"
+        # Prüfe ob entsprechender Snapshot im Ziel existiert
+        if echo "$target_snapshots" | grep -q "^${target_snapshot}$"; then
+            vlog "Gemeinsamer Snapshot gefunden: $source_snapshot" >&2
+            echo "$source_snapshot"
             return
         fi
     done <<< "$source_snapshots"
     
+    vlog "Kein gemeinsamer Snapshot gefunden" >&2
     echo ""
 }
 
@@ -354,30 +401,73 @@ perform_system_update() {
 
 # Hauptfunktion für Dataset-Backup
 backup_dataset() {
-    local source_dataset="$1"
-    local target_dataset="${BACKUP_POOL}/${source_dataset}"
+    local dataset_config="$1"
+    
+    # Dataset-Mapping parsen
+    local mapping=$(parse_dataset_mapping "$dataset_config")
+    local source_dataset="${mapping%%|*}"
+    local target_dataset="${mapping##*|}"
     
     log "INFO" "Starte Backup für Dataset: $source_dataset -> $target_dataset"
     
-    # Ziel-Dataset erstellen falls nicht vorhanden
+    # Prüfe ob Quell-Dataset existiert
     if [[ "$DRY_RUN" == false ]]; then
-        if ! zfs list "$target_dataset" >/dev/null 2>&1; then
-            log "INFO" "Erstelle Ziel-Dataset: $target_dataset"
-            zfs create -p "$target_dataset"
+        if ! zfs list "$source_dataset" >/dev/null 2>&1; then
+            log "ERROR" "Quell-Dataset existiert nicht: $source_dataset"
+            return 1
         fi
     fi
     
-    # Gemeinsamen Snapshot finden
-    local common_snapshot=$(find_common_snapshot "$source_dataset" "$target_dataset")
+    # Prüfe ob Ziel-Dataset existiert
+    local target_exists=false
+    if [[ "$DRY_RUN" == false ]]; then
+        if zfs list "$target_dataset" >/dev/null 2>&1; then
+            target_exists=true
+            log "INFO" "Ziel-Dataset existiert bereits: $target_dataset"
+        else
+            log "INFO" "Ziel-Dataset existiert nicht: $target_dataset"
+        fi
+    else
+        log "INFO" "Ziel-Dataset würde geprüft werden (Dry-Run): $target_dataset"
+        target_exists=true # Für Dry-Run annehmen dass es existiert
+    fi
+    
+    # Neuesten Snapshot finden
     local latest_snapshot=$(find_latest_snapshot "$source_dataset")
     
     if [[ -z "$latest_snapshot" ]]; then
         log "WARN" "Kein zfs-auto-snap_daily Snapshot in $source_dataset gefunden"
-        return
+        return 1
+    fi
+    
+    # Gemeinsamen Snapshot nur suchen wenn Ziel bereits existiert
+    local common_snapshot=""
+    if [[ "$target_exists" == true ]]; then
+        common_snapshot=$(find_common_snapshot "$source_dataset" "$target_dataset")
     fi
     
     vlog "Gemeinsamer Snapshot: ${common_snapshot:-'keiner'}"
     vlog "Neuester Snapshot: $latest_snapshot"
+    
+    # Entscheidung über Backup-Typ
+    if [[ -n "$common_snapshot" ]]; then
+        log "INFO" "Führe inkrementelles Backup durch (gemeinsamer Snapshot: ${common_snapshot##*@})"
+    elif [[ "$target_exists" == false ]] || [[ "$FULL_BACKUP_ON_NO_COMMON" == true ]]; then
+        if [[ "$target_exists" == false ]]; then
+            log "INFO" "Führe initiales vollständiges Backup durch (neues Ziel-Dataset)"
+        else
+            log "INFO" "Führe vollständiges Backup durch (FULL_BACKUP_ON_NO_COMMON=true)"
+        fi
+        common_snapshot="" # Sicherstellen dass vollständiges Backup gemacht wird
+    else
+        log "WARN" "Kein gemeinsamer Snapshot gefunden und FULL_BACKUP_ON_NO_COMMON=false"
+        log "INFO" "Optionen:"
+        log "INFO" "  1. Setze FULL_BACKUP_ON_NO_COMMON=true in der Konfiguration"
+        log "INFO" "  2. Führe manuelles vollständiges Backup durch:"
+        log "INFO" "     zfs send $latest_snapshot | zfs receive -F $target_dataset"
+        write_checkmk_piggyback "FAIL" "$latest_snapshot" "unknown"
+        return 1
+    fi
     
     # Snapshot übertragen
     if transfer_snapshot "$source_dataset" "$target_dataset" "$common_snapshot" "$latest_snapshot"; then
@@ -394,6 +484,7 @@ backup_dataset() {
         
         write_checkmk_piggyback "OK" "$latest_snapshot" "$snapshot_guid"
         log "INFO" "Backup für $source_dataset erfolgreich abgeschlossen"
+        return 0
     else
         write_checkmk_piggyback "FAIL" "$latest_snapshot" "unknown"
         log "ERROR" "Backup für $source_dataset fehlgeschlagen"
@@ -419,13 +510,13 @@ main() {
     # Speicherplatz prüfen
     check_free_space
     
-    # Datasets sichern
+    # Datasets sichern mit flexiblem Mapping
     local backup_success=true
     IFS=',' read -ra DATASET_ARRAY <<< "$DATASETS"
     
-    for dataset in "${DATASET_ARRAY[@]}"; do
-        dataset=$(echo "$dataset" | xargs) # Whitespace entfernen
-        if ! backup_dataset "$dataset"; then
+    for dataset_config in "${DATASET_ARRAY[@]}"; do
+        dataset_config=$(echo "$dataset_config" | xargs) # Whitespace entfernen
+        if ! backup_dataset "$dataset_config"; then
             backup_success=false
         fi
     done
