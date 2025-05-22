@@ -1,0 +1,476 @@
+#!/bin/bash
+
+# ZFS Backup Script v1.0
+# Automatisierte inkrementelle ZFS-Backups auf wechselnde externe Festplatten
+# Kompatibel mit Proxmox 8 / Debian 12
+
+set -euo pipefail
+
+# Globale Variablen
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/zfs-backup2-skript.conf"
+LOCKFILE="/var/run/zfs_backup.lock"
+LOGFILE="/var/log/zfs-backup2.log"
+VERBOSE=false
+DRY_RUN=false
+
+# Logging-Funktion
+log() {
+    local level="$1"
+    shift
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $*" | tee -a "$LOGFILE"
+}
+
+# Verbose Logging
+vlog() {
+    if [[ "$VERBOSE" == true ]]; then
+        log "DEBUG" "$@"
+    fi
+}
+
+# Fehlerbehandlung
+error_exit() {
+    log "ERROR" "$1"
+    cleanup
+    exit 1
+}
+
+# Cleanup-Funktion
+cleanup() {
+    if [[ -f "$LOCKFILE" ]]; then
+        rm -f "$LOCKFILE"
+        vlog "Lockfile entfernt"
+    fi
+    
+    # Export des Backup-Pools falls importiert
+    if [[ -n "${BACKUP_POOL:-}" ]] && zpool list "$BACKUP_POOL" >/dev/null 2>&1; then
+        log "INFO" "Exportiere Backup-Pool: $BACKUP_POOL"
+        if [[ "$DRY_RUN" == false ]]; then
+            zpool export "$BACKUP_POOL" || log "WARN" "Fehler beim Export von $BACKUP_POOL"
+        fi
+    fi
+}
+
+# Signal Handler
+trap cleanup EXIT INT TERM
+
+# Konfiguration laden
+load_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        error_exit "Konfigurationsdatei nicht gefunden: $CONFIG_FILE"
+    fi
+    
+    source "$CONFIG_FILE"
+    
+    # Validierung der Pflichtparameter
+    if [[ -z "${DATASETS:-}" ]]; then
+        error_exit "DATASETS nicht in Konfiguration definiert"
+    fi
+    
+    if [[ -z "${BACKUP_DISK_IDS:-}" ]]; then
+        error_exit "BACKUP_DISK_IDS nicht in Konfiguration definiert"
+    fi
+    
+    if [[ -z "${BACKUP_POOL:-}" ]]; then
+        error_exit "BACKUP_POOL nicht in Konfiguration definiert"
+    fi
+    
+    # Standardwerte setzen
+    MIN_FREE_SPACE_GB=${MIN_FREE_SPACE_GB:-10}
+    FULL_BACKUP_ON_NO_COMMON=${FULL_BACKUP_ON_NO_COMMON:-false}
+    SYSTEM_UPDATE_ENABLED=${SYSTEM_UPDATE_ENABLED:-false}
+    CHECKMK_ENABLED=${CHECKMK_ENABLED:-true}
+    CHECKMK_PIGGYBACK_DIR=${CHECKMK_PIGGYBACK_DIR:-"/var/spool/check_mk_agent/piggyback"}
+    
+    vlog "Konfiguration geladen:"
+    vlog "- DATASETS: $DATASETS"
+    vlog "- BACKUP_POOL: $BACKUP_POOL"
+    vlog "- MIN_FREE_SPACE_GB: $MIN_FREE_SPACE_GB"
+}
+
+# Lockfile prüfen und erstellen
+acquire_lock() {
+    if [[ -f "$LOCKFILE" ]]; then
+        local lock_age=$(($(date +%s) - $(stat -c %Y "$LOCKFILE")))
+        if [[ $lock_age -gt 3600 ]]; then
+            log "WARN" "Verwaistes Lockfile gefunden (Alter: ${lock_age}s), wird entfernt"
+            rm -f "$LOCKFILE"
+        else
+            error_exit "Backup bereits aktiv (Lockfile: $LOCKFILE)"
+        fi
+    fi
+    
+    echo $$ > "$LOCKFILE"
+    vlog "Lockfile erstellt: $LOCKFILE"
+}
+
+# Backup-Festplatte identifizieren und importieren
+identify_and_import_backup_disk() {
+    log "INFO" "Suche nach Backup-Festplatte..."
+    
+    local found_disk=""
+    IFS=',' read -ra DISK_IDS <<< "$BACKUP_DISK_IDS"
+    
+    for disk_id in "${DISK_IDS[@]}"; do
+        disk_id=$(echo "$disk_id" | xargs) # Whitespace entfernen
+        vlog "Prüfe Disk-ID: $disk_id"
+        
+        # Suche nach Festplatte anhand verschiedener Identifikatoren
+        local disk_path=""
+        if [[ -e "/dev/disk/by-id/wwn-$disk_id" ]]; then
+            disk_path="/dev/disk/by-id/wwn-$disk_id"
+        elif [[ -e "/dev/disk/by-id/ata-*$disk_id*" ]]; then
+            disk_path=$(ls /dev/disk/by-id/ata-*$disk_id* | head -1)
+        elif [[ -e "/dev/disk/by-serial/$disk_id" ]]; then
+            disk_path="/dev/disk/by-serial/$disk_id"
+        fi
+        
+        if [[ -n "$disk_path" ]]; then
+            found_disk="$disk_path"
+            log "INFO" "Backup-Festplatte gefunden: $found_disk (ID: $disk_id)"
+            break
+        fi
+    done
+    
+    if [[ -z "$found_disk" ]]; then
+        error_exit "Keine gültige Backup-Festplatte gefunden. Erwartete IDs: $BACKUP_DISK_IDS"
+    fi
+    
+    # Pool importieren
+    log "INFO" "Importiere Backup-Pool: $BACKUP_POOL"
+    if [[ "$DRY_RUN" == false ]]; then
+        if ! zpool import -d "$(dirname "$found_disk")" "$BACKUP_POOL"; then
+            error_exit "Fehler beim Import des Backup-Pools: $BACKUP_POOL"
+        fi
+    fi
+    
+    vlog "Backup-Pool erfolgreich importiert"
+}
+
+# Speicherplatz prüfen
+check_free_space() {
+    log "INFO" "Prüfe verfügbaren Speicherplatz auf $BACKUP_POOL"
+    
+    local available_gb
+    if [[ "$DRY_RUN" == false ]]; then
+        available_gb=$(zfs list -H -o avail "$BACKUP_POOL" | numfmt --from=iec --to-unit=1G)
+    else
+        available_gb=100 # Dummy-Wert für Dry-Run
+    fi
+    
+    if (( $(echo "$available_gb < $MIN_FREE_SPACE_GB" | bc -l) )); then
+        error_exit "Zu wenig freier Speicherplatz: ${available_gb}GB < ${MIN_FREE_SPACE_GB}GB"
+    fi
+    
+    log "INFO" "Verfügbarer Speicherplatz: ${available_gb}GB (Minimum: ${MIN_FREE_SPACE_GB}GB)"
+}
+
+# Gemeinsamen Snapshot finden
+find_common_snapshot() {
+    local source_dataset="$1"
+    local target_dataset="$2"
+    
+    vlog "Suche gemeinsamen Snapshot zwischen $source_dataset und $target_dataset"
+    
+    # Alle zfs-auto-snap_daily Snapshots der Quelle holen
+    local source_snapshots
+    if [[ "$DRY_RUN" == false ]]; then
+        source_snapshots=$(zfs list -H -t snapshot -o name "$source_dataset" 2>/dev/null | grep "zfs-auto-snap_daily" | sort -r || true)
+    else
+        source_snapshots="$source_dataset@zfs-auto-snap_daily-2024-01-20-00h00"
+    fi
+    
+    if [[ -z "$source_snapshots" ]]; then
+        vlog "Keine zfs-auto-snap_daily Snapshots in $source_dataset gefunden"
+        echo ""
+        return
+    fi
+    
+    # Prüfe jeden Snapshot auf Existenz im Ziel
+    while IFS= read -r snapshot; do
+        [[ -z "$snapshot" ]] && continue
+        
+        local snap_name="${snapshot##*@}"
+        local target_snapshot="${target_dataset}@${snap_name}"
+        
+        if [[ "$DRY_RUN" == false ]]; then
+            if zfs list -H -t snapshot "$target_snapshot" >/dev/null 2>&1; then
+                echo "$snapshot"
+                return
+            fi
+        else
+            echo "$snapshot"
+            return
+        fi
+    done <<< "$source_snapshots"
+    
+    echo ""
+}
+
+# Neuesten Snapshot finden
+find_latest_snapshot() {
+    local dataset="$1"
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        zfs list -H -t snapshot -o name "$dataset" 2>/dev/null | grep "zfs-auto-snap_daily" | sort -r | head -1 || true
+    else
+        echo "$dataset@zfs-auto-snap_daily-2024-01-21-00h00"
+    fi
+}
+
+# Snapshot übertragen
+transfer_snapshot() {
+    local source_dataset="$1"
+    local target_dataset="$2"
+    local common_snapshot="$3"
+    local latest_snapshot="$4"
+    
+    log "INFO" "Übertrage Snapshot: $latest_snapshot"
+    
+    if [[ -n "$common_snapshot" ]]; then
+        # Inkrementelle Übertragung
+        log "INFO" "Inkrementelle Übertragung von $common_snapshot zu $latest_snapshot"
+        vlog "Befehl: zfs send -I $common_snapshot $latest_snapshot | zfs receive -F $target_dataset"
+        
+        if [[ "$DRY_RUN" == false ]]; then
+            if ! zfs send -I "$common_snapshot" "$latest_snapshot" | zfs receive -F "$target_dataset"; then
+                error_exit "Fehler bei inkrementeller Übertragung"
+            fi
+        fi
+    else
+        # Vollständige Übertragung
+        if [[ "$FULL_BACKUP_ON_NO_COMMON" == true ]]; then
+            log "INFO" "Vollständige Übertragung: $latest_snapshot"
+            vlog "Befehl: zfs send $latest_snapshot | zfs receive -F $target_dataset"
+            
+            if [[ "$DRY_RUN" == false ]]; then
+                if ! zfs send "$latest_snapshot" | zfs receive -F "$target_dataset"; then
+                    error_exit "Fehler bei vollständiger Übertragung"
+                fi
+            fi
+        else
+            log "WARN" "Kein gemeinsamer Snapshot gefunden und FULL_BACKUP_ON_NO_COMMON=false"
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+# Alte Snapshots bereinigen
+cleanup_old_snapshots() {
+    local source_dataset="$1"
+    local target_dataset="$2"
+    
+    log "INFO" "Bereinige alte Snapshots in $target_dataset"
+    
+    # Alle zfs-auto-snap_daily Snapshots der Quelle holen
+    local source_snapshots
+    if [[ "$DRY_RUN" == false ]]; then
+        source_snapshots=$(zfs list -H -t snapshot -o name "$source_dataset" 2>/dev/null | grep "zfs-auto-snap_daily" | sed "s/.*@//" || true)
+    else
+        source_snapshots="zfs-auto-snap_daily-2024-01-21-00h00"
+    fi
+    
+    # Alle zfs-auto-snap_daily Snapshots des Ziels holen
+    local target_snapshots
+    if [[ "$DRY_RUN" == false ]]; then
+        target_snapshots=$(zfs list -H -t snapshot -o name "$target_dataset" 2>/dev/null | grep "zfs-auto-snap_daily" || true)
+    else
+        target_snapshots="$target_dataset@zfs-auto-snap_daily-2024-01-20-00h00"
+    fi
+    
+    # Prüfe jeden Ziel-Snapshot
+    while IFS= read -r target_snapshot; do
+        [[ -z "$target_snapshot" ]] && continue
+        
+        local snap_name="${target_snapshot##*@}"
+        
+        # Prüfe ob Snapshot noch in Quelle existiert
+        if ! echo "$source_snapshots" | grep -q "^$snap_name$"; then
+            log "INFO" "Lösche verwaisten Snapshot: $target_snapshot"
+            if [[ "$DRY_RUN" == false ]]; then
+                zfs destroy "$target_snapshot" || log "WARN" "Fehler beim Löschen von $target_snapshot"
+            fi
+        fi
+    done <<< "$target_snapshots"
+}
+
+# CheckMK Piggyback-Datei schreiben
+write_checkmk_piggyback() {
+    local status="$1"
+    local snapshot_name="$2"
+    local snapshot_guid="$3"
+    
+    if [[ "$CHECKMK_ENABLED" != true ]]; then
+        return
+    fi
+    
+    local hostname=$(hostname)
+    local piggyback_dir="$CHECKMK_PIGGYBACK_DIR/$hostname"
+    local piggyback_file="$piggyback_dir/zfs_backup"
+    
+    # Verzeichnis erstellen falls nicht vorhanden
+    mkdir -p "$piggyback_dir"
+    
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    cat > "$piggyback_file" << EOF
+<<<zfs_backup>>>
+Status: $status
+Timestamp: $timestamp
+Snapshot: $snapshot_name
+GUID: $snapshot_guid
+EOF
+    
+    log "INFO" "CheckMK Piggyback-Datei geschrieben: $piggyback_file"
+}
+
+# System-Update durchführen
+perform_system_update() {
+    if [[ "$SYSTEM_UPDATE_ENABLED" != true ]]; then
+        return
+    fi
+    
+    log "INFO" "Führe System-Update durch..."
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        if apt update && apt dist-upgrade -y; then
+            log "INFO" "System-Update erfolgreich abgeschlossen"
+        else
+            log "WARN" "System-Update fehlgeschlagen"
+        fi
+    else
+        log "INFO" "System-Update (Dry-Run)"
+    fi
+}
+
+# Hauptfunktion für Dataset-Backup
+backup_dataset() {
+    local source_dataset="$1"
+    local target_dataset="${BACKUP_POOL}/${source_dataset}"
+    
+    log "INFO" "Starte Backup für Dataset: $source_dataset -> $target_dataset"
+    
+    # Ziel-Dataset erstellen falls nicht vorhanden
+    if [[ "$DRY_RUN" == false ]]; then
+        if ! zfs list "$target_dataset" >/dev/null 2>&1; then
+            log "INFO" "Erstelle Ziel-Dataset: $target_dataset"
+            zfs create -p "$target_dataset"
+        fi
+    fi
+    
+    # Gemeinsamen Snapshot finden
+    local common_snapshot=$(find_common_snapshot "$source_dataset" "$target_dataset")
+    local latest_snapshot=$(find_latest_snapshot "$source_dataset")
+    
+    if [[ -z "$latest_snapshot" ]]; then
+        log "WARN" "Kein zfs-auto-snap_daily Snapshot in $source_dataset gefunden"
+        return
+    fi
+    
+    vlog "Gemeinsamer Snapshot: ${common_snapshot:-'keiner'}"
+    vlog "Neuester Snapshot: $latest_snapshot"
+    
+    # Snapshot übertragen
+    if transfer_snapshot "$source_dataset" "$target_dataset" "$common_snapshot" "$latest_snapshot"; then
+        # Alte Snapshots bereinigen
+        cleanup_old_snapshots "$source_dataset" "$target_dataset"
+        
+        # Snapshot-GUID für CheckMK holen
+        local snapshot_guid=""
+        if [[ "$DRY_RUN" == false ]]; then
+            snapshot_guid=$(zfs get -H -o value guid "$latest_snapshot" 2>/dev/null || echo "unknown")
+        else
+            snapshot_guid="12345678-1234-1234-1234-123456789abc"
+        fi
+        
+        write_checkmk_piggyback "OK" "$latest_snapshot" "$snapshot_guid"
+        log "INFO" "Backup für $source_dataset erfolgreich abgeschlossen"
+    else
+        write_checkmk_piggyback "FAIL" "$latest_snapshot" "unknown"
+        log "ERROR" "Backup für $source_dataset fehlgeschlagen"
+        return 1
+    fi
+}
+
+# Hauptfunktion
+main() {
+    local start_time=$(date)
+    log "INFO" "=== ZFS Backup gestartet ==="
+    log "INFO" "Startzeit: $start_time"
+    
+    # Konfiguration laden
+    load_config
+    
+    # Lockfile erstellen
+    acquire_lock
+    
+    # Backup-Festplatte identifizieren und importieren
+    identify_and_import_backup_disk
+    
+    # Speicherplatz prüfen
+    check_free_space
+    
+    # Datasets sichern
+    local backup_success=true
+    IFS=',' read -ra DATASET_ARRAY <<< "$DATASETS"
+    
+    for dataset in "${DATASET_ARRAY[@]}"; do
+        dataset=$(echo "$dataset" | xargs) # Whitespace entfernen
+        if ! backup_dataset "$dataset"; then
+            backup_success=false
+        fi
+    done
+    
+    # System-Update (vor Export)
+    if [[ "$backup_success" == true ]]; then
+        perform_system_update
+    fi
+    
+    # Backup-Pool exportieren (wird durch cleanup() erledigt)
+    log "INFO" "Backup-Prozess abgeschlossen"
+    
+    local end_time=$(date)
+    log "INFO" "Endzeit: $end_time"
+    log "INFO" "=== ZFS Backup beendet ==="
+    
+    if [[ "$backup_success" != true ]]; then
+        exit 1
+    fi
+}
+
+# Parameter-Parsing
+while getopts "vd" opt; do
+    case $opt in
+        v)
+            VERBOSE=true
+            ;;
+        d)
+            DRY_RUN=true
+            log "INFO" "Dry-Run Modus aktiviert"
+            ;;
+        \?)
+            echo "Verwendung: $0 [-v] [-d]"
+            echo "  -v  Verbose Logging"
+            echo "  -d  Dry-Run (nur Simulation)"
+            exit 1
+            ;;
+    esac
+done
+
+# Skript als Root ausführen
+if [[ $EUID -ne 0 ]]; then
+    error_exit "Dieses Skript muss als Root ausgeführt werden"
+fi
+
+# Abhängigkeiten prüfen
+for cmd in zfs zpool bc numfmt; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        error_exit "Erforderliches Programm nicht gefunden: $cmd"
+    fi
+done
+
+# Hauptfunktion ausführen
+main "$@"
