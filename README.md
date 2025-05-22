@@ -1,286 +1,199 @@
-# ZFSBackup2: Automatisierte und inkrementelle ZFS-Backups für Proxmox 8 auf Debian 12
-
-## Inhaltsverzeichnis
-
-1. [Überblick](#überblick)
-2. [Systemvoraussetzungen](#systemvoraussetzungen)
-3. [Installation](#installation)
-4. [Konfiguration](#konfiguration)
-5. [Verwendung](#verwendung)
-6. [Funktionen im Detail](#funktionen-im-detail)
-7. [Snapshot-Management](#snapshot-management)
-8. [CheckMK-Integration](#checkmk-integration)
-9. [Fehlerbehandlung](#fehlerbehandlung)
-10. [Wartung](#wartung)
-11. [Cron-Integration](#cron-integration)
-12. [Häufig gestellte Fragen](#häufig-gestellte-fragen)
+# ZFS Backup Script - Dokumentation
 
 ## Überblick
 
-ZFSBackup2 ist ein Bash-Skript, das automatisierte und inkrementelle ZFS-Backups von Proxmox 8 auf Debian 12 auf wechselnde externe Festplatten durchführt. Das Tool verwendet `zfs-auto-snapshot` für die Snapshot-Erstellung und ist für den regelmäßigen Einsatz mit wöchentlich wechselnden externen Festplatten optimiert.
+Das ZFS Backup Script automatisiert die inkrementelle Sicherung von ZFS-Datasets auf wechselnde externe Festplatten. Es wurde speziell für Proxmox 8 Systeme unter Debian 12 entwickelt und arbeitet mit den von `zfs-auto-snapshot` erstellten Snapshots.
 
-**Hauptmerkmale:**
+### Hauptfunktionen
 
-- Inkrementelle ZFS-Backups basierend auf wöchentlichen oder monatlichen Snapshots
-- Automatische Erkennung und Verwendung von externen Festplatten über eindeutige IDs
-- Intelligenter Vergleich von Snapshots zwischen Quelle und Ziel mittels GUID und Erstellungszeitstempel
-- Speicherplatzprüfung vor Backups
-- Integrierte Systemupdates nach erfolgreichen Backups
-- CheckMK-Integration für Überwachung
-- Umfangreiches Logging
+- **Inkrementelle Backups**: Übertragung nur geänderter Daten basierend auf Snapshots
+- **Festplatten-Rotation**: Unterstützung für wechselnde Backup-Festplatten
+- **Automatische Bereinigung**: Entfernung verwaister Snapshots
+- **CheckMK Integration**: Monitoring-Integration über Piggyback-Dateien
+- **Sicherheitsmechanismen**: Lockfile-Schutz, Speicherplatz-Prüfung
+- **Flexible Konfiguration**: Externe Konfigurationsdatei
 
-## Systemvoraussetzungen
+## Installation und Voraussetzungen
 
-- Debian 12 oder höher
-- Proxmox 8
-- ZFS-Dateisystem auf Quellsystem
-- Externe Festplatte mit ZFS-Pool
-- Installiertes `zfs-auto-snapshot`-Paket
-- Root-Rechte für die Ausführung des Skripts
+### Systemanforderungen
 
-### Benötigte Pakete
+- Proxmox 8 oder Debian 12
+- ZFS-Dateisystem konfiguriert
+- Root-Berechtigung für die Ausführung
+
+### Erforderliche Pakete
 
 ```bash
-apt-get update
-apt-get install -y zfsutils-linux zfs-auto-snapshot
+apt update
+apt install -y zfsutils-linux bc coreutils util-linux udev
 ```
 
-## Installation
-
-1. Erstellen Sie die notwendigen Verzeichnisse:
+### Zusätzliche Tools für erweiterte Funktionen
 
 ```bash
-mkdir -p /usr/local/sbin
-mkdir -p /etc/zfsbackup2
-mkdir -p /var/log/zfsbackup2
+# Für zfs-auto-snapshot (falls noch nicht installiert)
+apt install -y zfs-auto-snapshot
+
+# Für CheckMK Agent (optional)
+apt install -y check-mk-agent
 ```
 
-2. Kopieren Sie das Skript und die Konfigurationsdatei:
+### Installation des Scripts
 
+1. Script und Konfigurationsdatei in dasselbe Verzeichnis kopieren:
 ```bash
-cp zfsbackup2.sh /usr/local/sbin/
-cp zfsbackup2.conf /etc/zfsbackup2/
+mkdir -p /opt/zfs-backup
+cp zfs-backup2.sh /opt/zfs-backup/
+cp zfs-backup2-skript.conf /opt/zfs-backup/
+chmod +x /opt/zfs-backup/zfs-backup2.sh
 ```
 
-3. Setzen Sie die richtigen Berechtigungen:
-
+2. Log-Verzeichnis vorbereiten:
 ```bash
-chmod +x /usr/local/sbin/zfsbackup2.sh
-chmod 644 /etc/zfsbackup2/zfsbackup2.conf
+touch /var/log/zfs-backup2.log
+chmod 640 /var/log/zfs-backup2.log
 ```
 
 ## Konfiguration
 
-Die Konfigurationsdatei liegt unter `/etc/zfsbackup2/zfsbackup2.conf` und enthält alle notwendigen Parameter für das Backup.
+### Konfigurationsdatei (zfs-backup2-skript.conf)
 
-### Wichtige Konfigurationsparameter
+Die Konfiguration erfolgt über die Datei `zfs-backup2-skript.conf`, die im gleichen Verzeichnis wie das Script liegen muss.
+
+#### Pflichtparameter
+
+**DATASETS**
+```bash
+DATASETS=rpool/data01,rpool/data02,rpool/vms
+```
+- Kommagetrennte Liste der zu sichernden ZFS-Datasets
+- Keine Leerzeichen zwischen den Einträgen
+- Beispiel: Sicherung von Daten und VM-Speicher
+
+**BACKUP_DISK_IDS**
+```bash
+BACKUP_DISK_IDS=0x5000c500a1b2c3d4,WD-ABCD1234567890
+```
+- Eindeutige Identifikatoren der erlaubten Backup-Festplatten
+- Unterstützte Formate:
+  - WWN (World Wide Name): `0x5000c500a1b2c3d4`
+  - ATA-Serial: `WD-ABCD1234567890`
+  - Andere eindeutige Seriennummern
+
+**BACKUP_POOL**
+```bash
+BACKUP_POOL=backup
+```
+- Name des ZFS-Pools auf der Backup-Festplatte
+- Muss auf allen Backup-Festplatten identisch sein
+
+#### Optionale Parameter
+
+**MIN_FREE_SPACE_GB**
+```bash
+MIN_FREE_SPACE_GB=10
+```
+- Minimaler freier Speicherplatz in GB
+- Script bricht ab bei Unterschreitung
+
+**FULL_BACKUP_ON_NO_COMMON**
+```bash
+FULL_BACKUP_ON_NO_COMMON=false
+```
+- Verhalten bei fehlendem gemeinsamen Snapshot
+- `true`: Vollständiges Backup wird durchgeführt
+- `false`: Dataset wird übersprungen (sicherer)
+
+**SYSTEM_UPDATE_ENABLED**
+```bash
+SYSTEM_UPDATE_ENABLED=false
+```
+- Automatisches System-Update nach erfolgreichem Backup
+- Führt `apt update && apt dist-upgrade -y` aus
+
+### Festplatten-Identifikation
+
+Zur eindeutigen Identifikation der Backup-Festplatten können verschiedene Methoden verwendet werden:
 
 ```bash
-# Zu sichernde Datasets (durch Kommas getrennt)
-DATASETS="rpool/data,rpool/vm"
+# WWN (World Wide Name) ermitteln
+lsblk -o NAME,WWN
 
-# Name des Zielpools auf der externen Festplatte
-TARGET_POOL="backuppool"
+# ATA-Seriennummer ermitteln
+udevadm info --query=property --name=/dev/sdX | grep ID_SERIAL
 
-# Erlaubte externe Festplatten-IDs (durch Kommas getrennt)
-# Verwenden Sie WWN oder Seriennummern von lsblk -o name,serial,wwn
-ALLOWED_DISK_IDS="0x5000c500c128d767,WD-WXYZ1A2B3C"
-
-# Maximale Auslastung des Zielpools in Prozent (0-100)
-MAX_USAGE=80
-
-# Maximale Anzahl von Wiederholungen bei fehlgeschlagenen Backups
-MAX_RETRIES=1
-
-# Zu verwendende Snapshot-Typen (durch Kommas getrennt)
-# Nur weekly und monthly werden empfohlen
-SNAPSHOT_TYPES="weekly,monthly"
+# Alle verfügbaren IDs anzeigen
+ls -la /dev/disk/by-id/
 ```
 
-### Festplatten-IDs ermitteln
+## Funktionsweise
 
-Um die IDs Ihrer externen Festplatten zu ermitteln, verwenden Sie folgenden Befehl:
+### Backup-Prozess
 
+1. **Initialisierung**
+   - Konfiguration laden und validieren
+   - Lockfile erstellen (verhindert parallele Ausführung)
+   - Backup-Festplatte identifizieren und ZFS-Pool importieren
+
+2. **Vorbereitung**
+   - Verfügbaren Speicherplatz prüfen
+   - Abbruch bei unzureichendem Speicher
+
+3. **Dataset-Backup (für jedes konfigurierte Dataset)**
+   - Neuesten `zfs-auto-snap_daily` Snapshot der Quelle finden
+   - Gemeinsamen Snapshot zwischen Quelle und Ziel suchen
+   - Inkrementelle oder vollständige Übertragung durchführen
+   - Verwaiste Snapshots im Ziel bereinigen
+
+4. **Nachbearbeitung**
+   - CheckMK Piggyback-Datei schreiben
+   - Optional: System-Update durchführen
+   - Backup-Pool exportieren
+   - Cleanup und Lockfile entfernen
+
+### Snapshot-Handling
+
+Das Script arbeitet ausschließlich mit Snapshots, die das Präfix `zfs-auto-snap_daily` haben. Diese werden typischerweise von `zfs-auto-snapshot` erstellt.
+
+**Inkrementelle Übertragung:**
 ```bash
-lsblk -d -o NAME,SIZE,MODEL,SERIAL,WWN
+zfs send -I <gemeinsamer_snapshot> <aktueller_snapshot> | zfs receive -F <ziel_dataset>
 ```
 
-Verwenden Sie entweder die WWN oder die Seriennummer in der Konfigurationsdatei.
+**Vollständige Übertragung:**
+```bash
+zfs send <snapshot> | zfs receive -F <ziel_dataset>
+```
+
+### Snapshot-Rotation
+
+Alte Snapshots auf dem Backup-Pool werden automatisch bereinigt:
+- Snapshots, die auf der Quelle nicht mehr existieren, werden entfernt
+- Erhält die Konsistenz zwischen Quelle und Ziel
+- Spart Speicherplatz auf der Backup-Festplatte
 
 ## Verwendung
 
-Das Skript kann manuell oder durch Cron ausgeführt werden.
-
-### Manuelle Ausführung
+### Kommandozeilen-Parameter
 
 ```bash
-/usr/local/sbin/zfsbackup2.sh
+./zfs-backup2.sh [OPTIONEN]
 ```
 
-### Befehlszeilenparameter
+**-v (Verbose)**
+- Aktiviert detailliertes Logging
+- Zeigt ausgeführte Befehle und Debug-Informationen
+- Hilfreich für Fehlerdiagnose
 
-```
-Usage: zfsbackup2.sh [options]
+**-d (Dry-Run)**
+- Simuliert den Backup-Prozess ohne Änderungen
+- Zeigt geplante Aktionen an
+- Ideal zum Testen der Konfiguration
 
-Options:
-  -c, --config FILE    Spezifische Konfigurationsdatei verwenden (Standard: /etc/zfsbackup2/zfsbackup2.conf)
-  -h, --help           Hilfe anzeigen und beenden
-  -v, --version        Versionsinformation anzeigen und beenden
-  -t, --test           Konfiguration testen und beenden
-```
-
-### Konfigurationstest
-
-Sie können die Konfiguration vor dem eigentlichen Backup testen:
+### Beispiele
 
 ```bash
-/usr/local/sbin/zfsbackup2.sh --test
-```
+# Normaler Backup-Lauf
+./zfs-backup2.sh
 
-## Funktionen im Detail
-
-### Snapshot-Vergleich
-
-Das Skript vergleicht die Snapshots auf Quelle und Ziel anhand der GUID und des Erstellungszeitstempels. Es wählt den neuesten gemeinsamen Snapshot für inkrementelle Backups aus, mit folgender Priorität:
-1. `weekly`
-2. `monthly`
-
-Es werden niemals `hourly`, `daily` oder `frequent` Snapshots für Backups verwendet.
-
-### Inkrementelles Backup
-
-Das Skript führt inkrementelle Backups durch, indem es `zfs send -I` und `zfs receive` nutzt. Wenn kein gemeinsamer Snapshot gefunden wird, wird ein vollständiges Backup durchgeführt.
-
-Beispiel für einen inkrementellen Backup-Befehl:
-```bash
-zfs send -v -I 'rpool/data@zfs-auto-snap_weekly-2023-05-01-1200' 'rpool/data@zfs-auto-snap_weekly-2023-05-08-1200' | zfs receive -F -v 'backuppool/data'
-```
-
-### Festplatten-Handling
-
-Das Skript erkennt automatisch die zulässigen externen Festplatten anhand ihrer eindeutigen IDs (WWN oder Seriennummer). Es importiert den ZFS-Pool zu Beginn des Backups und exportiert ihn am Ende wieder.
-
-### Speicherplatzprüfung
-
-Vor dem Backup wird überprüft, ob auf dem Zielpool genügend Speicherplatz vorhanden ist. Wenn die Auslastung den konfigurierten Grenzwert überschreitet (Standard: 80%), wird das Backup abgebrochen.
-
-### Systemupdates
-
-Nach einem erfolgreichen Backup führt das Skript ein Systemupdate durch:
-```bash
-apt-get update && apt-get dist-upgrade -y
-```
-
-Wenn ein Neustart erforderlich ist, wird dies im CheckMK-Status vermerkt.
-
-## Snapshot-Management
-
-ZFSBackup2 nutzt die von `zfs-auto-snapshot` erstellten Snapshots. Es verwendet nur die `weekly` und `monthly` Snapshots für Backups, da diese langlebiger sind und einen besseren inkrementellen Backup-Pfad bieten.
-
-Die Snapshots auf dem Zielsystem spiegeln die Snapshots auf dem Quellsystem wider. Wenn ein Snapshot auf dem Quellsystem gelöscht wird, wird er bei der nächsten Ausführung auch auf dem Zielsystem nicht mehr referenziert.
-
-## CheckMK-Integration
-
-Das Skript erstellt eine Piggyback-Datei für CheckMK unter dem Pfad `/var/lib/check_mk_agent/spool/zfsbackup2_status`. Diese enthält Informationen über:
-
-- Den aktuellen Status des Backups
-- Zeitstempel des letzten erfolgreichen Backups
-- Vergleich der Snapshots auf Quelle und Ziel
-- Informationen zu Systemupdates und ob ein Neustart erforderlich ist
-
-### Beispiel einer CheckMK-Ausgabe
-
-```
-<<<zfsbackup2>>>
-P "ZFS Backup Status" 0 - Last run: 2023-05-10 14:30:45
-P "rpool/data" 0 - Last backup: 2023-05-08 12:00:00, source latest: 2023-05-08 12:00:00
-P "rpool/vm" 0 - Last backup: 2023-05-08 12:00:00, source latest: 2023-05-08 12:00:00
-P "System Update Status" 0 - System updated, no reboot required
-```
-
-### Status-Codes
-
-- `0`: Alles in Ordnung
-- `1`: Warnung (z.B. Backup älter als ein Tag)
-- `2`: Kritischer Fehler (z.B. Backup fehlgeschlagen)
-
-## Fehlerbehandlung
-
-Das Skript verfügt über umfangreiche Fehlerbehandlung und Logging. Bei Fehlern werden entsprechende Informationen in der Logdatei und in der CheckMK-Statusdatei gespeichert.
-
-### Häufige Fehlermeldungen
-
-- **"No allowed external drives found"**: Keine der in der Konfiguration angegebenen externen Festplatten wurde gefunden.
-- **"Failed to import pool"**: Der ZFS-Pool konnte nicht von der externen Festplatte importiert werden.
-- **"Pool is too full"**: Der Zielpool hat die maximale Auslastungsgrenze überschritten.
-- **"No suitable snapshots found"**: Es wurden keine geeigneten Snapshots auf dem Quellsystem gefunden.
-
-### Wiederholungslogik
-
-Das Skript versucht fehlgeschlagene Backups zu wiederholen. Die Anzahl der Wiederholungen kann in der Konfigurationsdatei festgelegt werden.
-
-## Wartung
-
-### Logdateien
-
-Die Logdateien befinden sich unter `/var/log/zfsbackup2/zfsbackup2.log`. Es wird empfohlen, eine Logrotation einzurichten, um zu verhindern, dass die Logdateien zu groß werden.
-
-Beispiel für eine Logrotate-Konfiguration unter `/etc/logrotate.d/zfsbackup2`:
-
-```
-/var/log/zfsbackup2/zfsbackup2.log {
-    weekly
-    rotate 4
-    compress
-    missingok
-    notifempty
-    create 0640 root root
-}
-```
-
-### Überprüfung der externen Festplatten
-
-Es wird empfohlen, die externen Festplatten regelmäßig auf SMART-Fehler zu überprüfen:
-
-```bash
-smartctl -a /dev/sdX
-```
-
-## Cron-Integration
-
-Es wird empfohlen, das Skript über Cron regelmäßig auszuführen. Hier ein Beispiel für einen wöchentlichen Backup-Job:
-
-```
-# ZFSBackup2 - Wöchentliches Backup jeden Sonntag um 01:00 Uhr
-0 1 * * 0 root /usr/local/sbin/zfsbackup2.sh >> /var/log/zfsbackup2/cron.log 2>&1
-```
-
-Fügen Sie diese Zeile in `/etc/crontab` ein oder erstellen Sie eine neue Datei unter `/etc/cron.d/zfsbackup2`.
-
-## Häufig gestellte Fragen
-
-### Warum werden nur `weekly` und `monthly` Snapshots verwendet?
-
-Die `weekly` und `monthly` Snapshots bieten eine bessere langfristige Konsistenz und sind länger verfügbar, was für inkrementelle Backups auf wechselnden externen Festplatten wichtig ist. Die `hourly` und `daily` Snapshots werden oft schneller rotiert und könnten bei wöchentlichen Backup-Zyklen bereits gelöscht sein.
-
-### Was passiert, wenn die externe Festplatte nicht erkannt wird?
-
-Das Skript bricht sauber ab und hinterlässt eine entsprechende Meldung in der Logdatei und im CheckMK-Status.
-
-### Wie sieht ein typischer Backup-Workflow aus?
-
-1. Anschließen der externen Festplatte
-2. Ausführen des Backup-Skripts (automatisch per Cron oder manuell)
-3. Skript erkennt die erlaubte Festplatte und importiert den ZFS-Pool
-4. Für jedes konfigurierte Dataset wird ein inkrementelles Backup durchgeführt
-5. Nach erfolgreichen Backups werden Systemupdates ausgeführt
-6. Der ZFS-Pool wird exportiert und die Festplatte kann entfernt werden
-7. Festplatte kann sicher verwahrt und in der nächsten Woche mit einer anderen Festplatte ausgetauscht werden
-
-### Kann ich mehrere externe Festplatten gleichzeitig verwenden?
-
-Ja, das Skript erkennt alle konfigurierten Festplatten. Es verwendet jedoch immer nur die erste erkannte Festplatte für das Backup.
-
-### Wie kann ich überprüfen, ob das Backup erfolgreich war?
-
-Sie können die Logdatei unter `/var/log/zfsbackup2/zfsbackup2.log` überprüfen oder den CheckMK-Status kontrollieren. Bei erfolgreichen Backups sollte der CheckMK-Status "0" sein.
+# Mit det
