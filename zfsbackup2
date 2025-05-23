@@ -311,43 +311,57 @@ transfer_snapshot() {
     return 0
 }
 
-# Alte Snapshots bereinigen
+# Alte Snapshots bereinigen (alle zfs-auto-snap Typen)
 cleanup_old_snapshots() {
     local source_dataset="$1"
     local target_dataset="$2"
     
     log "INFO" "Bereinige alte Snapshots in $target_dataset"
     
-    # Alle zfs-auto-snap_daily Snapshots der Quelle holen
-    local source_snapshots
-    if [[ "$DRY_RUN" == false ]]; then
-        source_snapshots=$(zfs list -H -t snapshot -o name "$source_dataset" 2>/dev/null | grep "zfs-auto-snap_daily" | sed "s/.*@//" || true)
-    else
-        source_snapshots="zfs-auto-snap_daily-2024-01-21-00h00"
-    fi
+    # Alle zfs-auto-snap Snapshot-Typen definieren
+    local snap_types=("daily" "hourly" "weekly" "monthly" "frequent")
     
-    # Alle zfs-auto-snap_daily Snapshots des Ziels holen
-    local target_snapshots
-    if [[ "$DRY_RUN" == false ]]; then
-        target_snapshots=$(zfs list -H -t snapshot -o name "$target_dataset" 2>/dev/null | grep "zfs-auto-snap_daily" || true)
-    else
-        target_snapshots="$target_dataset@zfs-auto-snap_daily-2024-01-20-00h00"
-    fi
-    
-    # Prüfe jeden Ziel-Snapshot
-    while IFS= read -r target_snapshot; do
-        [[ -z "$target_snapshot" ]] && continue
+    for snap_type in "${snap_types[@]}"; do
+        vlog "Bereinige $snap_type Snapshots..."
         
-        local snap_name="${target_snapshot##*@}"
-        
-        # Prüfe ob Snapshot noch in Quelle existiert
-        if ! echo "$source_snapshots" | grep -q "^$snap_name$"; then
-            log "INFO" "Lösche verwaisten Snapshot: $target_snapshot"
-            if [[ "$DRY_RUN" == false ]]; then
-                zfs destroy "$target_snapshot" || log "WARN" "Fehler beim Löschen von $target_snapshot"
-            fi
+        # Alle zfs-auto-snap_$snap_type Snapshots der Quelle holen
+        local source_snapshots
+        if [[ "$DRY_RUN" == false ]]; then
+            source_snapshots=$(zfs list -H -t snapshot -o name "$source_dataset" 2>/dev/null | grep "zfs-auto-snap_${snap_type}" | sed "s/.*@//" || true)
+        else
+            source_snapshots="zfs-auto-snap_${snap_type}-2024-01-21-00h00"
         fi
-    done <<< "$target_snapshots"
+        
+        # Alle zfs-auto-snap_$snap_type Snapshots des Ziels holen
+        local target_snapshots
+        if [[ "$DRY_RUN" == false ]]; then
+            target_snapshots=$(zfs list -H -t snapshot -o name "$target_dataset" 2>/dev/null | grep "zfs-auto-snap_${snap_type}" || true)
+        else
+            target_snapshots="$target_dataset@zfs-auto-snap_${snap_type}-2024-01-20-00h00"
+        fi
+        
+        if [[ -z "$target_snapshots" ]]; then
+            vlog "Keine $snap_type Snapshots im Ziel gefunden"
+            continue
+        fi
+        
+        # Prüfe jeden Ziel-Snapshot
+        while IFS= read -r target_snapshot; do
+            [[ -z "$target_snapshot" ]] && continue
+            
+            local snap_name="${target_snapshot##*@}"
+            
+            # Prüfe ob Snapshot noch in Quelle existiert
+            if ! echo "$source_snapshots" | grep -q "^$snap_name$"; then
+                log "INFO" "Lösche verwaisten $snap_type Snapshot: $target_snapshot"
+                if [[ "$DRY_RUN" == false ]]; then
+                    zfs destroy "$target_snapshot" || log "WARN" "Fehler beim Löschen von $target_snapshot"
+                fi
+            else
+                vlog "Behalte $snap_type Snapshot: $target_snapshot (existiert noch in Quelle)"
+            fi
+        done <<< "$target_snapshots"
+    done
 }
 
 # CheckMK Piggyback-Datei schreiben
