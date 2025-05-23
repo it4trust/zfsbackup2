@@ -539,4 +539,357 @@ cleanup_old_snapshots() {
             else
                 vlog "Behalte $snap_type Snapshot: $target_snapshot (existiert noch in Quelle)"
             fi
-        done <<< "$target_snap
+        done <<< "$target_snapshots"
+    done
+}
+
+# CheckMK Piggyback-Datei schreiben (Global)
+write_checkmk_piggyback_global() {
+    local overall_status="$1"
+    local disk_id="$2"
+    local disk_usage_hours="$3"
+    
+    if [[ "$CHECKMK_ENABLED" != true ]]; then
+        return
+    fi
+    
+    local hostname=$(hostname)
+    local piggyback_dir="$CHECKMK_PIGGYBACK_DIR/$hostname"
+    local piggyback_file="$piggyback_dir/zfs_backup_global"
+    
+    # Verzeichnis erstellen falls nicht vorhanden
+    mkdir -p "$piggyback_dir"
+    
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    cat > "$piggyback_file" << EOF
+<<<zfs_backup_global>>>
+Status: $overall_status
+Timestamp: $timestamp
+Success_Count: $BACKUP_SUCCESS_COUNT
+Failure_Count: $BACKUP_FAILURE_COUNT
+Current_Disk: $disk_id
+Disk_Usage_Hours: $disk_usage_hours
+Max_Disk_Usage_Hours: $MAX_DISK_USAGE_HOURS
+EOF
+    
+    # Disk-Rotation Warnung
+    if [[ "$MAX_DISK_USAGE_HOURS" -gt 0 ]] && [[ "$disk_usage_hours" -gt "$MAX_DISK_USAGE_HOURS" ]]; then
+        echo "Disk_Rotation_Warning: true" >> "$piggyback_file"
+    else
+        echo "Disk_Rotation_Warning: false" >> "$piggyback_file"
+    fi
+    
+    vlog "CheckMK Global Piggyback-Datei geschrieben: $piggyback_file"
+}
+
+# CheckMK Piggyback-Datei schreiben (Dataset-spezifisch)
+write_checkmk_piggyback_dataset() {
+    local dataset_name="$1"
+    local status="$2"
+    local snapshot_name="$3"
+    local snapshot_guid="$4"
+    local backup_type="$5"
+    
+    if [[ "$CHECKMK_ENABLED" != true ]] || [[ "$CHECKMK_DETAILED_SERVICES" != true ]]; then
+        return
+    fi
+    
+    local hostname=$(hostname)
+    local piggyback_dir="$CHECKMK_PIGGYBACK_DIR/$hostname"
+    local safe_dataset_name=$(echo "$dataset_name" | tr '/' '_')
+    local piggyback_file="$piggyback_dir/zfs_backup_${safe_dataset_name}"
+    
+    # Verzeichnis erstellen falls nicht vorhanden
+    mkdir -p "$piggyback_dir"
+    
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    cat > "$piggyback_file" << EOF
+<<<zfs_backup_dataset>>>
+Dataset: $dataset_name
+Status: $status
+Timestamp: $timestamp
+Snapshot: $snapshot_name
+GUID: $snapshot_guid
+Backup_Type: $backup_type
+EOF
+    
+    vlog "CheckMK Dataset Piggyback-Datei geschrieben: $piggyback_file"
+}
+
+# System-Update durchführen
+perform_system_update() {
+    if [[ "$SYSTEM_UPDATE_ENABLED" != true ]]; then
+        return
+    fi
+    
+    log "INFO" "Führe System-Update durch..."
+    
+    if [[ "$DRY_RUN" == false ]]; then
+        if apt update && apt dist-upgrade -y; then
+            log "INFO" "System-Update erfolgreich abgeschlossen"
+        else
+            log "WARN" "System-Update fehlgeschlagen"
+        fi
+    else
+        log "INFO" "System-Update (Dry-Run)"
+    fi
+}
+
+# Hauptfunktion für Dataset-Backup
+backup_dataset() {
+    local dataset_config="$1"
+    
+    # Dataset-Mapping parsen
+    local mapping=$(parse_dataset_mapping "$dataset_config")
+    local source_dataset="${mapping%%|*}"
+    local target_dataset="${mapping##*|}"
+    
+    log "INFO" "Starte Backup für Dataset: $source_dataset -> $target_dataset"
+    
+    # Prüfe ob Quell-Dataset existiert
+    if [[ "$DRY_RUN" == false ]]; then
+        if ! zfs list "$source_dataset" >/dev/null 2>&1; then
+            log "ERROR" "Quell-Dataset existiert nicht: $source_dataset"
+            write_checkmk_piggyback_dataset "$source_dataset" "FAIL" "N/A" "unknown" "N/A"
+            return 1
+        fi
+    fi
+    
+    # Prüfe ob Ziel-Dataset existiert
+    local target_exists=false
+    if [[ "$DRY_RUN" == false ]]; then
+        if zfs list "$target_dataset" >/dev/null 2>&1; then
+            target_exists=true
+            log "INFO" "Ziel-Dataset existiert bereits: $target_dataset"
+        else
+            log "INFO" "Ziel-Dataset existiert nicht: $target_dataset"
+        fi
+    else
+        log "INFO" "Ziel-Dataset würde geprüft werden (Dry-Run): $target_dataset"
+        target_exists=true # Für Dry-Run annehmen dass es existiert
+    fi
+    
+    # Neuesten Snapshot finden
+    local latest_snapshot=$(find_latest_snapshot "$source_dataset")
+    
+    if [[ -z "$latest_snapshot" ]]; then
+        log "WARN" "Kein ${SNAPSHOT_PREFIX:-zfs-auto-snap_daily} Snapshot in $source_dataset gefunden"
+        write_checkmk_piggyback_dataset "$source_dataset" "FAIL" "N/A" "unknown" "N/A"
+        return 1
+    fi
+    
+    # Gemeinsamen Snapshot nur suchen wenn Ziel bereits existiert
+    local common_snapshot=""
+    local backup_type="full"
+    if [[ "$target_exists" == true ]]; then
+        common_snapshot=$(find_common_snapshot "$source_dataset" "$target_dataset")
+        if [[ -n "$common_snapshot" ]]; then
+            backup_type="incremental"
+        fi
+    fi
+    
+    vlog "Gemeinsamer Snapshot: ${common_snapshot:-'keiner'}"
+    vlog "Neuester Snapshot: $latest_snapshot"
+    vlog "Backup-Typ: $backup_type"
+    
+    # Entscheidung über Backup-Typ
+    if [[ -n "$common_snapshot" ]]; then
+        log "INFO" "Führe inkrementelles Backup durch (gemeinsamer Snapshot: ${common_snapshot##*@})"
+    elif [[ "$target_exists" == false ]] || [[ "$FULL_BACKUP_ON_NO_COMMON" == true ]]; then
+        if [[ "$target_exists" == false ]]; then
+            log "INFO" "Führe initiales vollständiges Backup durch (neues Ziel-Dataset)"
+        else
+            log "INFO" "Führe vollständiges Backup durch (FULL_BACKUP_ON_NO_COMMON=true)"
+        fi
+        common_snapshot="" # Sicherstellen dass vollständiges Backup gemacht wird
+    else
+        log "WARN" "Kein gemeinsamer Snapshot gefunden und FULL_BACKUP_ON_NO_COMMON=false"
+        log "INFO" "Optionen:"
+        log "INFO" "  1. Setze FULL_BACKUP_ON_NO_COMMON=true in der Konfiguration"
+        log "INFO" "  2. Führe manuelles vollständiges Backup durch:"
+        log "INFO" "     zfs send $latest_snapshot | zfs receive -F $target_dataset"
+        write_checkmk_piggyback_dataset "$source_dataset" "FAIL" "$latest_snapshot" "unknown" "skipped"
+        return 1
+    fi
+    
+    # Snapshot übertragen
+    if transfer_snapshot "$source_dataset" "$target_dataset" "$common_snapshot" "$latest_snapshot"; then
+        # Alte Snapshots bereinigen
+        cleanup_old_snapshots "$source_dataset" "$target_dataset"
+        
+        # Snapshot-GUID für CheckMK holen
+        local snapshot_guid=""
+        if [[ "$DRY_RUN" == false ]]; then
+            snapshot_guid=$(zfs get -H -o value guid "$latest_snapshot" 2>/dev/null || echo "unknown")
+        else
+            snapshot_guid="12345678-1234-1234-1234-123456789abc"
+        fi
+        
+        write_checkmk_piggyback_dataset "$source_dataset" "OK" "$latest_snapshot" "$snapshot_guid" "$backup_type"
+        log "INFO" "Backup für $source_dataset erfolgreich abgeschlossen"
+        return 0
+    else
+        write_checkmk_piggyback_dataset "$source_dataset" "FAIL" "$latest_snapshot" "unknown" "$backup_type"
+        log "ERROR" "Backup für $source_dataset fehlgeschlagen"
+        return 1
+    fi
+}
+
+# Berechne aktuelle Disk-Nutzungsdauer
+get_current_disk_usage_hours() {
+    local disk_id="$1"
+    
+    if [[ -z "$disk_id" ]]; then
+        echo "0"
+        return
+    fi
+    
+    local tracking_file="$DISK_ROTATION_DIR/${disk_id}.usage"
+    
+    if [[ ! -f "$tracking_file" ]]; then
+        echo "0"
+        return
+    fi
+    
+    # Prüfe ob Disk noch in Verwendung ist
+    if ! grep -q "^end_time=" "$tracking_file"; then
+        # Disk ist noch in Verwendung, berechne aktuelle Dauer
+        local start_time=$(grep "^start_time=" "$tracking_file" | cut -d= -f2 2>/dev/null || echo "0")
+        local current_time=$(date +%s)
+        local usage_hours=$(( (current_time - start_time) / 3600 ))
+        echo "$usage_hours"
+    else
+        # Disk ist nicht mehr in Verwendung
+        local duration_hours=$(grep "^duration_hours=" "$tracking_file" | cut -d= -f2 2>/dev/null || echo "0")
+        echo "$duration_hours"
+    fi
+}
+
+# Hauptfunktion
+main() {
+    local start_time=$(date)
+    log "INFO" "=== ZFS Backup v2.0 gestartet ==="
+    log "INFO" "Startzeit: $start_time"
+    
+    # Konfiguration laden
+    load_config
+    
+    # Lockfile erstellen
+    acquire_lock
+    
+    # Backup-Festplatte identifizieren und importieren
+    identify_and_import_backup_disk
+    
+    # Speicherplatz prüfen
+    check_free_space
+    
+    # Datasets sichern mit flexiblem Mapping und Graceful Degradation
+    local overall_success=true
+    IFS=',' read -ra DATASET_ARRAY <<< "$DATASETS"
+    
+    for dataset_config in "${DATASET_ARRAY[@]}"; do
+        dataset_config=$(echo "$dataset_config" | xargs) # Whitespace entfernen
+        
+        if backup_dataset "$dataset_config"; then
+            BACKUP_SUCCESS_COUNT=$((BACKUP_SUCCESS_COUNT + 1))
+            log "INFO" "Dataset erfolgreich gesichert: $dataset_config"
+        else
+            BACKUP_FAILURE_COUNT=$((BACKUP_FAILURE_COUNT + 1))
+            log "ERROR" "Dataset-Backup fehlgeschlagen: $dataset_config"
+            
+            # Prüfe ob weitergemacht werden soll
+            if [[ "$CONTINUE_ON_DATASET_FAILURE" != true ]]; then
+                log "ERROR" "CONTINUE_ON_DATASET_FAILURE=false - Backup wird abgebrochen"
+                overall_success=false
+                break
+            fi
+            
+            # Prüfe maximale Anzahl Fehler
+            if [[ "$MAX_DATASET_FAILURES" -gt 0 ]] && [[ "$BACKUP_FAILURE_COUNT" -ge "$MAX_DATASET_FAILURES" ]]; then
+                log "ERROR" "Maximale Anzahl Dataset-Fehler erreicht ($MAX_DATASET_FAILURES) - Backup wird abgebrochen"
+                overall_success=false
+                break
+            fi
+            
+            overall_success=false
+        fi
+    done
+    
+    # Disk-Nutzung beenden tracken
+    if [[ -n "$CURRENT_DISK_ID" ]]; then
+        track_disk_usage "$CURRENT_DISK_ID" "end"
+    fi
+    
+    # Aktuelle Disk-Nutzungsdauer ermitteln
+    local current_disk_usage_hours=$(get_current_disk_usage_hours "$CURRENT_DISK_ID")
+    
+    # Gesamtstatus bestimmen
+    local overall_status="OK"
+    if [[ "$overall_success" != true ]]; then
+        if [[ "$BACKUP_SUCCESS_COUNT" -gt 0 ]]; then
+            overall_status="PARTIAL"
+        else
+            overall_status="FAIL"
+        fi
+    fi
+    
+    # CheckMK Global Status schreiben
+    write_checkmk_piggyback_global "$overall_status" "$CURRENT_DISK_ID" "$current_disk_usage_hours"
+    
+    # System-Update (vor Export, nur bei erfolgreichem Backup)
+    if [[ "$overall_status" == "OK" ]]; then
+        perform_system_update
+    fi
+    
+    # Backup-Pool exportieren (wird durch cleanup() erledigt)
+    log "INFO" "Backup-Prozess abgeschlossen"
+    log "INFO" "Erfolgreiche Datasets: $BACKUP_SUCCESS_COUNT"
+    log "INFO" "Fehlgeschlagene Datasets: $BACKUP_FAILURE_COUNT"
+    log "INFO" "Gesamtstatus: $overall_status"
+    
+    local end_time=$(date)
+    log "INFO" "Endzeit: $end_time"
+    log "INFO" "=== ZFS Backup v2.0 beendet ==="
+    
+    if [[ "$overall_status" == "FAIL" ]]; then
+        exit 1
+    elif [[ "$overall_status" == "PARTIAL" ]]; then
+        exit 2
+    fi
+}
+
+# Parameter-Parsing
+while getopts "vd" opt; do
+    case $opt in
+        v)
+            VERBOSE=true
+            ;;
+        d)
+            DRY_RUN=true
+            log "INFO" "Dry-Run Modus aktiviert"
+            ;;
+        \?)
+            echo "Verwendung: $0 [-v] [-d]"
+            echo "  -v  Verbose Logging"
+            echo "  -d  Dry-Run (nur Simulation)"
+            exit 1
+            ;;
+    esac
+done
+
+# Skript als Root ausführen
+if [[ $EUID -ne 0 ]]; then
+    error_exit "Dieses Skript muss als Root ausgeführt werden"
+fi
+
+# Abhängigkeiten prüfen
+for cmd in zfs zpool bc numfmt; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        error_exit "Erforderliches Programm nicht gefunden: $cmd"
+    fi
+done
+
+# Hauptfunktion ausführen
+main "$@"
